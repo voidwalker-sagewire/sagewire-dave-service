@@ -32,6 +32,7 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 # App code
 COPY herdmate_vet_api.py .
 COPY herdmate_vet_ingest.py .
+COPY unl_sources.txt .
 
 # Dave reads its knowledge base from the persistent volume.
 # CHROMA path defaults here point at the mounted volume.
