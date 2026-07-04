@@ -200,6 +200,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='HerdMate Vet AI — Knowledge Ingestion')
     parser.add_argument('--pdf', help='Path to a PDF file')
     parser.add_argument('--url', help='URL to scrape')
+    parser.add_argument('--url-list', help='Path to a text file of URLs (one per line, # comments ok)')
     parser.add_argument('--dir', help='Directory of PDFs')
     parser.add_argument('--msd', action='store_true', help='Ingest MSD Veterinary Manual cattle pages')
     parser.add_argument('--status', action='store_true', help='Show collection status')
@@ -216,6 +217,21 @@ if __name__ == "__main__":
 
     elif args.url:
         ingest_url(collection, args.url)
+
+    elif args.url_list:
+        with open(args.url_list) as _f:
+            urls = [ln.strip() for ln in _f if ln.strip() and not ln.strip().startswith('#')]
+        print(f'\n📚 Ingesting {len(urls)} URLs from {args.url_list}...')
+        ok, fail = 0, 0
+        for i, u in enumerate(urls, 1):
+            print(f'\n[{i}/{len(urls)}] {u}')
+            try:
+                ingest_url(collection, u)
+                ok += 1
+            except Exception as e:
+                print(f'   ⚠️ failed: {e}')
+                fail += 1
+        print(f'\n✅ Done — {ok} ingested, {fail} failed. Total in KB: {collection.count()} chunks')
 
     elif args.dir:
         ingest_directory(collection, args.dir)
