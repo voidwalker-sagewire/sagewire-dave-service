@@ -1,0 +1,14 @@
+# NEVER commit the service-account credentials
+credentials.json
+*.credentials.json
+
+# Local ChromaDB (built from ingest; lives on a volume in prod)
+herdmate_vet_db/
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
