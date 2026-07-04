@@ -1,0 +1,50 @@
+# DAVE Knowledge Base — University of Nebraska-Lincoln Beef Extension Sources
+# Primary source: UNL BeefWatch / beef.unl.edu (public land-grant extension,
+# meant for distribution to producers, attributable).
+#
+# Each line is a URL the ingest script fetches. Comments (#) are ignored.
+# Attribution is preserved: the ingest script stores the source URL with each
+# chunk, so DAVE cites where knowledge came from.
+#
+# Verified reachable as of 2026-07-04.
+
+# ─────────────────────────────────────────────────────────────
+# CALF SCOURS / NEONATAL DIARRHEA
+# ─────────────────────────────────────────────────────────────
+https://beef.unl.edu/beefwatch/2023/understanding-scours/
+https://beef.unl.edu/beefwatch/2024/webinar-revisit-preventing-calf-scours-and-using-sandhills-calving-method/
+https://beef.unl.edu/beefwatch/2022/prosperous-start-newborn-calves/
+https://beef.unl.edu/scours-coccidiosis/
+
+# ─────────────────────────────────────────────────────────────
+# CALVING / DYSTOCIA / WHEN TO INTERVENE
+# ─────────────────────────────────────────────────────────────
+https://beef.unl.edu/calving-problems-when-intervene/
+https://beef.unl.edu/beefwatch/2023/cow-herd-report-card-ii-measures-performance/
+https://beef.unl.edu/beefwatch/2024/heifer-harmony-optimal-management-heifers-feedlot/
+
+# ─────────────────────────────────────────────────────────────
+# BODY CONDITION SCORING / COW NUTRITION
+# ─────────────────────────────────────────────────────────────
+https://beef.unl.edu/learning/condition1a.shtml
+https://beef.unl.edu/using-body-condition-score-to-manage-the-nutritional-program/
+https://beef.unl.edu/beefwatch/2023/cow-nutrition-considerations-calving-and-early-lactation/
+https://beef.unl.edu/beefwatch/importance-cow-nutrition-calving-through-breeding/
+https://beef.unl.edu/beefwatch/2023/thin-cows-and-limited-hay-resources-what-are-my-options/
+https://beef.unl.edu/beefwatch/2024/winterizing-your-cowherd-managing-cows-through-cold-stress/
+
+# ─────────────────────────────────────────────────────────────
+# HERD HEALTH / VACCINATION PROTOCOLS
+# ─────────────────────────────────────────────────────────────
+https://beef.unl.edu/what-vaccines-should-i-use-tips-establishing-vaccination-protocols/
+https://beef.unl.edu/beefwatch/recognizing-and-managing-differences-health-risk-incoming-feeder-cattle/
+
+# ─────────────────────────────────────────────────────────────
+# PINKEYE / EYE HEALTH
+# ─────────────────────────────────────────────────────────────
+https://beef.unl.edu/beefwatch/2020/pinkeye-cattle/
+
+# ─────────────────────────────────────────────────────────────
+# BULL SELECTION / BREEDING SOUNDNESS
+# ─────────────────────────────────────────────────────────────
+https://beef.unl.edu/economically-relevant-traits/
