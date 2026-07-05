@@ -1,61 +1,703 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SageWire — Gateway to the Forge</title>
-  <meta name="description" content="SageWire is a modular AI service platform for real-world applications: speech, location, weather, shared memory, veterinary intelligence, gateway routing, and field documentation." />
-  <style>
-    :root{
-      --bg:#050914;--bg2:#081526;--panel:#0c1728;--panel2:#101f34;--ink:#f5f7fb;--muted:#9fb0c7;--line:#20334d;--cyan:#67e8f9;--green:#22c55e;--amber:#fbbf24;--red:#fb7185;--white:#fff;
-      --shadow:0 24px 70px rgba(0,0,0,.45);
+#!/usr/bin/env python3
+"""
+HerdMate DAVE Vet AI — FastAPI Backend v4 (dynamic sheet reading)
+Uses Google Service Account for permanent server-side auth.
+No OAuth tokens. No browser dependency. Works forever.
+
+v3.1 CHANGES FROM v3:
+- find_animal() now collects ALL matches for a tag across both tabs
+  instead of returning the first hit. Ranches reuse tag numbers across
+  years, so "765" can be a sold 2025 bull AND a live 2026 heifer calf.
+  We rank matches (active status first, then most recent date) and
+  attach the runner-up matches so DAVE can flag ambiguity instead of
+  silently guessing and confusing the rancher.
+- format_animal_context() now surfaces "_other_matches" so DAVE's
+  answer can say "I've got two 765s, which one?" instead of assuming.
+- VET_SYSTEM_PROMPT updated with explicit instruction on this behavior.
+
+Run:
+    pip install fastapi uvicorn chromadb sentence-transformers anthropic \
+        google-auth requests --break-system-packages
+    export ANTHROPIC_API_KEY='sk-ant-...'        # required, never hardcode
+    export CREDENTIALS_FILE='/root/credentials.json'   # service account JSON
+    python3 herdmate_vet_api.py                  # serves on port 8001
+
+Optional env vars: CHROMA_HOST, CHROMA_PORT, CLAUDE_MODEL, PORT.
+Front it with HTTPS (Certbot/Cloudflare) so the field app's Bluetooth and
+microphone work — browsers block those on plain HTTP.
+"""
+
+import os
+import json
+import hashlib
+import requests as http_requests
+from datetime import datetime
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+import chromadb
+from chromadb.utils import embedding_functions
+import anthropic
+from google.oauth2.service_account import Credentials
+import google.auth.transport.requests
+
+app = FastAPI(title="HerdMate DAVE Vet AI", version="4.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://scanner.herdmate.ag",
+        "https://api.herdmate.ag",
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://localhost",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── CONFIG ──
+CHROMA_HOST = os.environ.get("CHROMA_HOST", "localhost")
+CHROMA_PORT = int(os.environ.get("CHROMA_PORT", "8000"))
+# Persistent path for Dave's vet-knowledge DB. On Coolify this is a mounted
+# volume so the knowledge survives redeploys/reboots. Defaults to a local
+# folder for dev.
+CHROMA_DB_PATH = os.environ.get("CHROMA_DB_PATH", "./herdmate_vet_db")
+VET_COLLECTION = "herdmate_vet_knowledge"
+MEMORY_COLLECTION = "herdmate_vet_memory"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+CREDENTIALS_FILE = os.environ.get("CREDENTIALS_FILE", "/root/credentials.json")
+SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+# Optional: general-purpose RAG SERVICE for non-vet documents (equipment
+# manuals, SOPs, labels, etc). Dave OWNS its vet knowledge, but MAY call
+# this reusable service for other document types. Service->service is
+# allowed by the SageWire rule; a service never depends on a product.
+RAG_SERVICE_URL = os.environ.get("RAG_SERVICE_URL", "")  # e.g. https://rag.sagewire.dev
+SERVER_PORT = int(os.environ.get("PORT", "5005"))
+
+# Fail fast and loud if the key is missing. This is the single guard that
+# prevents DAVE from silently degrading into a keyless wrapper that returns
+# 500s on every question. The real DAVE always has its key in the environment.
+if not ANTHROPIC_API_KEY:
+    raise RuntimeError(
+        "ANTHROPIC_API_KEY is not set. Export it before starting DAVE:\n"
+        "    export ANTHROPIC_API_KEY='sk-ant-...'\n"
+        "Never hardcode the key into this file."
+    )
+
+# ── SERVICE ACCOUNT AUTH ──
+_service_creds = None
+
+def get_service_token():
+    global _service_creds
+    try:
+        if _service_creds is None:
+            _service_creds = Credentials.from_service_account_file(
+                CREDENTIALS_FILE, scopes=SHEETS_SCOPES
+            )
+        if not _service_creds.valid:
+            auth_req = google.auth.transport.requests.Request()
+            _service_creds.refresh(auth_req)
+        return _service_creds.token
+    except Exception as e:
+        print(f"Service account auth error: {e}")
+        return None
+
+# ── SIMPLE CACHE ──
+_animal_cache: dict = {}
+CACHE_TTL_SECONDS = 300
+
+def get_cached_animal(key: str):
+    import time
+    if key in _animal_cache:
+        record, ts = _animal_cache[key]
+        if time.time() - ts < CACHE_TTL_SECONDS:
+            return record
+    return "MISS"
+
+def set_cached_animal(key: str, record):
+    import time
+    _animal_cache[key] = (record, time.time())
+
+# ── CHROMA CLIENT ──
+def get_chroma():
+    # Prefer a standalone Chroma server if one is configured/running.
+    # Otherwise read the persistent on-disk DB (the mounted volume in prod).
+    try:
+        client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+        client.heartbeat()
+        return client
+    except Exception:
+        return chromadb.PersistentClient(path=CHROMA_DB_PATH)
+
+ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+    model_name="all-MiniLM-L6-v2"
+)
+
+chroma = get_chroma()
+vet_collection = chroma.get_or_create_collection(VET_COLLECTION, embedding_function=ef)
+memory_collection = chroma.get_or_create_collection(MEMORY_COLLECTION, embedding_function=ef)
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ── MODELS ──
+class VetQuestion(BaseModel):
+    question: str
+    operation: Optional[str] = "HerdMate"
+    tag_epc: Optional[str] = None
+    pasture: Optional[str] = None
+    weather: Optional[str] = None
+    user_id: Optional[str] = "default"
+    conversation_history: list = Field(default_factory=list)
+    image_base64: Optional[str] = None
+    image_type: Optional[str] = "image/jpeg"
+    google_access_token: Optional[str] = None   # deprecated - server uses service account
+    herdmate_sheet_id: Optional[str] = None
+    google_user_email: Optional[str] = None
+
+class VetAnswer(BaseModel):
+    answer: str
+    sources: list
+    similar_past_cases: list
+    confidence: str
+    timestamp: str
+    animal_context: Optional[dict] = None
+
+# ── GOOGLE SHEETS LOOKUP ──
+def sheets_get(token: str, sheet_id: str, range_name: str):
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{range_name}"
+    try:
+        resp = http_requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10
+        )
+        if resp.ok:
+            return resp.json().get("values", [])
+        else:
+            print(f"Sheets error {resp.status_code}: {resp.text[:200]}")
+            return []
+    except Exception as e:
+        print(f"Sheets request error: {e}")
+        return []
+
+def _is_active_status(status: str) -> bool:
+    """True if a status string reads as 'currently on the operation'."""
+    s = str(status).strip().lower()
+    if not s:
+        return True  # blank status = assume active, don't punish missing data
+    if "inactive" in s or "sold" in s or "dead" in s or "died" in s or "culled" in s:
+        return False
+    return True
+
+def _best_date(record: dict) -> str:
+    """Pull whichever date field a record has for recency sorting."""
+    return record.get("birth_date") or record.get("date") or ""
+
+def _norm_tag(v) -> str:
+    """Normalize a tag/UHF/RFID value for comparison: string, stripped, upper."""
+    return str(v).strip().upper()
+
+def _row_matches_tag(row_dict: dict, tag: str) -> bool:
+    """
+    Dynamic match: does ANY plausible identifier column in this row equal the tag?
+
+    We do NOT hardcode a single column name. Ranches put the tag/UHF/RFID in
+    differently-named columns across tabs and those names change over time.
+    Instead we look at every column whose HEADER looks like an identifier
+    field, and match against all of them. New id column added later? It gets
+    picked up automatically as long as its header contains one of these hints.
+    """
+    tag_n = _norm_tag(tag)
+    if not tag_n:
+        return False
+    id_hints = ("tag", "uhf", "rfid", "epc", "dual freq", "int", "registration", "lin")
+    for header, value in row_dict.items():
+        h = str(header).strip().lower()
+        if any(hint in h for hint in id_hints):
+            if _norm_tag(value) == tag_n:
+                return True
+    return False
+
+def _status_of(row_dict: dict) -> str:
+    """Find a status-like column value without hardcoding which tab names it."""
+    for header, value in row_dict.items():
+        if str(header).strip().lower() == "status":
+            return str(value)
+    return ""
+
+def _is_active_status(status: str) -> bool:
+    """True if a status reads as 'currently on the operation'."""
+    s = str(status).strip().lower()
+    if not s:
+        return True  # blank = assume active, don't punish missing data
+    for dead in ("inactive", "sold", "dead", "died", "culled", "deceased", "disposed"):
+        if dead in s:
+            return False
+    return True
+
+def _best_date_value(row_dict: dict) -> str:
+    """
+    Grab a date for recency ranking. Prefer birth date, then any created/date
+    column. Purely for sorting duplicate tags — newest animal wins.
+    """
+    # Priority order of header hints
+    for want in ("birth date", "date", "createddate", "created date"):
+        for header, value in row_dict.items():
+            if str(header).strip().lower() == want and str(value).strip():
+                return str(value).strip()
+    # Fallback: any header containing "date"
+    for header, value in row_dict.items():
+        if "date" in str(header).strip().lower() and str(value).strip():
+            return str(value).strip()
+    return ""
+
+def _find_photo_path(row_dict: dict) -> str:
+    """
+    Return a photo path from this row if present, without hardcoding the
+    column name. Different tabs call it Photo, Picture, Photo Album, etc.
+    """
+    photo_hints = ("photo", "picture", "image", "img")
+    for header, value in row_dict.items():
+        h = str(header).strip().lower()
+        if any(hint in h for hint in photo_hints):
+            v = str(value).strip()
+            if v and v.lower() not in ("none", "null"):
+                return v
+    return ""
+
+def _find_lin(row_dict: dict) -> str:
+    """Surface the Livestock Identification Number (GS1 provenance anchor)."""
+    for header, value in row_dict.items():
+        h = str(header).strip().lower()
+        # match the LIN value column but not the 'LIN Sequence' helper column
+        if "livestock identification number" in h and "sequence" not in h:
+            v = str(value).strip()
+            if v:
+                return v
+        if h == "lin":
+            v = str(value).strip()
+            if v:
+                return v
+    return ""
+
+def _clean_row(row_dict: dict) -> dict:
+    """
+    Drop empty cells so the AI sees a compact, readable record instead of
+    100 blank columns. Keeps whatever has a value, whatever it's named.
+    """
+    out = {}
+    for header, value in row_dict.items():
+        h = str(header).strip()
+        v = "" if value is None else str(value).strip()
+        if not h:
+            continue
+        if v == "" or v.lower() in ("none", "null"):
+            continue
+        # skip obvious internal/noise columns
+        if h.lower().startswith("column_"):
+            continue
+        out[h] = v
+    return out
+
+def _tab_priority(tab: str) -> int:
+    """
+    Higher = more authoritative as THE animal record.
+    Primary animal tabs outrank event-log tabs so a palpation/scrotal entry
+    never gets mistaken for the animal itself.
+    """
+    t = str(tab).strip().lower()
+    if t in ("ranch tracker", "animals"):
+        return 3          # master animal records
+    if t in ("calf tracker",):
+        return 2          # calving records (also a primary record of the animal)
+    if t in ("watchlist", "bovine beacon"):
+        return 1          # monitoring context
+    return 0              # event logs: palpation, scrotal, etc.
+
+# Tabs Dave searches for a per-animal match. Confirmed live by the operator.
+# Dave reads the FULL row from any tab where the tag matches — column names
+# are discovered dynamically, so this list is the only thing that's fixed,
+# and even here unknown/missing tabs are skipped gracefully.
+SEARCHABLE_TABS = [
+    "Ranch Tracker",
+    "Calf Tracker",
+    "Palpation Log",     # NOTE: the spaced one, not "PalpationLog"
+    "ScrotalExamLog",
+    "WatchList",
+    "Bovine Beacon",     # live sheet only (not always present)
+    "Animals",           # live sheet only (not always present)
+]
+
+def find_animal(sheet_id: str, tag_identifier: str):
+    """
+    DYNAMIC animal lookup (v4).
+
+    Old behavior (v3.1 and earlier): hardcoded a specific list of column
+    names per tab. Any rename/addition/move in the sheet broke Dave. This
+    version instead:
+      - searches each configured tab,
+      - matches the tag against ANY identifier-looking column (dynamic),
+      - grabs the ENTIRE matching row with all its columns/headers,
+      - ranks duplicates (active first, then newest),
+      - returns the best match plus any other matches for disambiguation,
+      - carries a compact "all fields" dict so the AI sees everything.
+
+    The AI reads the real columns, whatever they're named today. Sheet
+    changes need no code change here.
+    """
+    if not tag_identifier or not sheet_id:
+        return None
+
+    cache_key = f"{sheet_id}_{tag_identifier}"
+    cached = get_cached_animal(cache_key)
+    if cached != "MISS":
+        return cached
+
+    token = get_service_token()
+    if not token:
+        return None
+
+    tag = str(tag_identifier).strip()
+    all_matches = []
+
+    for tab in SEARCHABLE_TABS:
+        try:
+            # Pull a wide range; Sheets returns only populated columns.
+            data = sheets_get(token, sheet_id, f"{tab}!A:CZ")
+            if not data or len(data) < 2:
+                continue
+            headers = data[0]
+            for row in data[1:]:
+                if not row:
+                    continue
+                row_dict = dict(zip(headers, row + [""] * max(0, len(headers) - len(row))))
+                if _row_matches_tag(row_dict, tag):
+                    fields = _clean_row(row_dict)
+                    all_matches.append({
+                        "source": tab,
+                        "tag": tag,
+                        "status": _status_of(row_dict),
+                        "_date": _best_date_value(row_dict),
+                        "photo": _find_photo_path(row_dict),
+                        "lin": _find_lin(row_dict),
+                        "fields": fields,  # the full dynamic record
+                    })
+        except Exception as e:
+            # A missing tab (e.g. Bovine Beacon not in this sheet) just gets skipped.
+            print(f"[find_animal] tab '{tab}' skipped: {e}")
+            continue
+
+    if not all_matches:
+        set_cached_animal(cache_key, None)
+        return None
+
+    # Rank matches. Priority, highest wins:
+    #   1. Is it a primary animal record vs just an event log about the animal?
+    #   2. Active status before inactive/sold.
+    #   3. Most recent date.
+    # A palpation/scrotal log row is an EVENT, not the animal — it must never
+    # outrank the actual Ranch Tracker / Calf Tracker animal record.
+    def _rank_key(m):
+        return (
+            _tab_priority(m.get("source", "")),
+            _is_active_status(m.get("status", "")),
+            m.get("_date", ""),
+        )
+    all_matches.sort(key=_rank_key, reverse=True)
+
+    best = all_matches[0]
+
+    # If multiple records share this tag (across tabs OR reused across years),
+    # attach the others so DAVE can disambiguate instead of guessing.
+    if len(all_matches) > 1:
+        best = dict(best)
+        best["_ambiguous"] = True
+        best["_other_matches"] = [
+            {
+                "source": m.get("source"),
+                "status": m.get("status") or "unknown",
+                "date": m.get("_date") or "unknown date",
+                # a couple of human-readable hints pulled dynamically
+                "hint": _short_hint(m.get("fields", {})),
+            }
+            for m in all_matches[1:]
+        ]
+
+    set_cached_animal(cache_key, best)
+    return best
+
+def _short_hint(fields: dict) -> str:
+    """A tiny human descriptor for disambiguation, pulled dynamically."""
+    bits = []
+    for want in ("Color", "Calf Color", "Sex", "Calf Sex", "Type", "Calf Type", "Breed"):
+        for h, v in fields.items():
+            if h.strip().lower() == want.lower() and v:
+                bits.append(v)
+                break
+        if len(bits) >= 3:
+            break
+    return " ".join(bits) if bits else "record"
+
+def format_animal_context(animal: dict) -> str:
+    """
+    Render the animal record for the AI. DYNAMIC: prints whatever fields the
+    row actually had, so new/renamed columns show up automatically. Adds the
+    LIN prominently and flags tag ambiguity.
+    """
+    if not animal:
+        return ""
+
+    lines = [f"--- ANIMAL RECORD (from tab: {animal.get('source', 'HerdMate')}) ---"]
+
+    # LIN up top — the provenance anchor.
+    if animal.get("lin"):
+        lines.append(f"Livestock Identification Number (LIN): {animal['lin']}")
+
+    # The full dynamic field set — everything the row actually contained.
+    # Skip the LIN column here since we already printed it at the top.
+    fields = animal.get("fields", {})
+    if fields:
+        for header, value in fields.items():
+            h_low = str(header).strip().lower()
+            if "livestock identification number" in h_low and "sequence" not in h_low:
+                continue  # already shown at top
+            lines.append(f"{header}: {value}")
+
+    # If a photo path exists, tell the AI it's available.
+    if animal.get("photo"):
+        lines.append(f"[Photo on file: {animal['photo']}]")
+
+    # Ambiguity flag — multiple animals share this tag.
+    if animal.get("_ambiguous") and animal.get("_other_matches"):
+        lines.append("")
+        lines.append("⚠️ MULTIPLE RECORDS SHARE THIS TAG. You are shown the most likely")
+        lines.append("one (active and/or most recent). Others with the same tag:")
+        for m in animal["_other_matches"]:
+            lines.append(f"  - {m['source']}: {m['hint']}, status: {m['status']}, date: {m['date']}")
+        lines.append("If the conversation doesn't make it obvious which animal the rancher")
+        lines.append("means, briefly ask. Tag numbers get reused across years on ranches.")
+
+    return "\n".join(lines)
+
+
+def search_knowledge(question: str, n_results: int = 5):
+    try:
+        results = vet_collection.query(
+            query_texts=[question],
+            n_results=min(n_results, vet_collection.count() or 1)
+        )
+        return list(zip(results.get("documents", [[]])[0], results.get("metadatas", [[]])[0]))
+    except Exception as e:
+        print(f"Knowledge search error: {e}")
+        return []
+
+def search_memory(question: str, user_id: str, n_results: int = 3):
+    try:
+        if memory_collection.count() == 0:
+            return []
+        where_filter = {"user_id": {"$eq": user_id}}
+        results = memory_collection.query(
+            query_texts=[question],
+            n_results=min(n_results, memory_collection.count()),
+            where=where_filter
+        )
+        return list(zip(results.get("documents", [[]])[0], results.get("metadatas", [[]])[0]))
+    except Exception as e:
+        print(f"Memory search error: {e}")
+        return []
+
+def save_to_memory(question: str, answer: str, metadata: dict):
+    try:
+        doc_id = hashlib.md5(f"{question}_{datetime.now().isoformat()}".encode()).hexdigest()
+        memory_collection.add(
+            ids=[doc_id],
+            documents=[f"Q: {question}\nA: {answer}"],
+            metadatas=[{**metadata, "timestamp": datetime.now().isoformat(), "type": "field_case"}]
+        )
+    except Exception as e:
+        print(f"Memory save error: {e}")
+
+# ── SYSTEM PROMPT ──
+VET_SYSTEM_PROMPT = """You are DAVE — Don't Always Visit the Emergency Vet.
+You are a cattle health assistant built for working ranchers in the field by HerdMate.
+
+You are NOT a replacement for a veterinarian. You are a knowledgeable field reference.
+
+Your style:
+- Plain language. Direct. Get to the point fast.
+- Practical. What do I do RIGHT NOW.
+- Honest about uncertainty.
+
+Only recommend calling a vet when it genuinely warrants it:
+- EMERGENCY (say it first, loud): not breathing, severe bleeding, prolapse, broken bones, downer cow that can't rise, bloat with distress, difficult calving over 2 hours
+- URGENT (mention once at end): fever over 104, eye cloudiness or corneal ulcer, calf not nursing after 6 hours, signs of BRD
+- MONITOR (no vet mention needed): mild lameness, early scours with alert calf, minor wounds, routine questions
+
+The disclaimer at the top of the app already covers liability. Do not repeat it in every response.
+If you do recommend a vet call, say it once clearly and move on.
+
+When you have an animal record, use it. Reference specific details — tag number, age, dam, birth weight.
+Make your answers personal to that specific animal.
+
+TAG NUMBER AMBIGUITY: Working ranches reuse tag numbers across years — the animal
+record you're given may include a note that OTHER animals share this same tag
+(look for "MULTIPLE ANIMALS SHARE THIS TAG NUMBER" in the record). When you see
+that note, don't silently assume you have the right animal. Briefly confirm which
+one the rancher means — mention the other match(es) by status/date/color so they
+can correct you in one word if you guessed wrong. Once they confirm or the
+conversation makes it obvious, drop it and move on. Don't belabor it.
+
+You have access to:
+1. Veterinary knowledge base — MSD Veterinary Manual and beef cattle extension publications
+2. The rancher's personal field history — past cases and outcomes
+3. Animal records from HerdMate Google Sheet when a tag is provided"""
+
+# ── MAIN ENDPOINT ──
+@app.post("/vet/ask", response_model=VetAnswer)
+async def ask_vet(q: VetQuestion):
+    if not q.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    effective_user_id = q.google_user_email or q.user_id or "default"
+
+    # Look up animal if tag provided
+    animal_record = None
+    animal_context = ""
+    if q.tag_epc and q.herdmate_sheet_id:
+        animal_record = find_animal(q.herdmate_sheet_id, q.tag_epc)
+        if animal_record:
+            animal_context = format_animal_context(animal_record)
+
+    # RAG search
+    vet_results = search_knowledge(q.question)
+    past_cases = search_memory(q.question, effective_user_id)
+
+    # Build dynamic system prompt
+    dynamic_system = VET_SYSTEM_PROMPT
+
+    # Tell DAVE what TODAY is. Without this, the model guesses the year from
+    # its training data and can't reason about recently-born animals (e.g. a
+    # calf born in 2026 looks impossible if DAVE thinks it's still 2025).
+    _now = datetime.now()
+    dynamic_system += (
+        f"\n\n--- TODAY'S DATE ---\n"
+        f"Today is {_now.strftime('%A, %B %d, %Y')}. "
+        f"The current year is {_now.year}. "
+        f"When you reason about animals' ages, birth years, or what's recent, "
+        f"use THIS as the current date. Do not assume any other year."
+    )
+
+    if animal_context:
+        dynamic_system += "\n\n" + animal_context
+
+    ctx_parts = []
+    if q.operation: ctx_parts.append(f"Operation: {q.operation}")
+    if q.pasture: ctx_parts.append(f"Pasture: {q.pasture}")
+    if q.weather: ctx_parts.append(f"Weather: {q.weather}")
+    if q.tag_epc and not animal_record: ctx_parts.append(f"Scanned tag: {q.tag_epc} (no record found)")
+    if ctx_parts:
+        dynamic_system += "\n\n--- FIELD CONTEXT ---\n" + "\n".join(ctx_parts)
+
+    sources = []
+    if vet_results:
+        vet_ctx = "\n\n--- VETERINARY KNOWLEDGE ---"
+        for doc, meta in vet_results:
+            source = meta.get("source", "veterinary reference")
+            vet_ctx += f"\n[{source}]\n{doc}\n"
+            if source not in sources:
+                sources.append(source)
+        dynamic_system += vet_ctx
+
+    past_case_summaries = []
+    if past_cases:
+        mem_ctx = "\n\n--- YOUR PAST FIELD CASES ---"
+        for doc, meta in past_cases:
+            ts = meta.get("timestamp", "")[:10]
+            mem_ctx += f"\n[{ts}] {doc}\n"
+            past_case_summaries.append(f"{ts}: {doc[:100]}...")
+        dynamic_system += mem_ctx
+
+    # Build conversation
+    claude_messages = []
+    for msg in q.conversation_history[-8:]:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if content:
+            claude_messages.append({"role": role, "content": content})
+
+    if q.image_base64:
+        current_content = [
+            {"type": "image", "source": {"type": "base64", "media_type": q.image_type or "image/jpeg", "data": q.image_base64}},
+            {"type": "text", "text": q.question}
+        ]
+    else:
+        current_content = q.question
+
+    claude_messages.append({"role": "user", "content": current_content})
+
+    try:
+        response = claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=700,
+            system=dynamic_system,
+            messages=claude_messages
+        )
+        text_blocks = [b for b in response.content if b.type == "text"]
+        answer = text_blocks[0].text if text_blocks else "DAVE could not generate a response."
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI response failed: {str(e)}")
+
+    save_to_memory(
+        question=q.question,
+        answer=answer,
+        metadata={
+            "user_id": effective_user_id,
+            "operation": q.operation or "",
+            "pasture": q.pasture or "",
+            "tag_epc": q.tag_epc or "",
+            "weather": q.weather or ""
+        }
+    )
+
+    return VetAnswer(
+        answer=answer,
+        sources=sources[:3],
+        similar_past_cases=past_case_summaries[:2],
+        confidence="high" if vet_results else "low",
+        timestamp=datetime.now().isoformat(),
+        animal_context=animal_record
+    )
+
+@app.get("/vet/status")
+async def vet_status():
+    return {
+        "status": "online",
+        "vet_knowledge_docs": vet_collection.count(),
+        "field_memory_docs": memory_collection.count(),
+        "ready": vet_collection.count() > 0,
+        "service_account": os.path.exists(CREDENTIALS_FILE)
     }
-    *{box-sizing:border-box} html{scroll-behavior:smooth} body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:var(--ink);background:radial-gradient(900px 500px at 20% 0%,rgba(103,232,249,.18),transparent 55%),radial-gradient(800px 500px at 85% 10%,rgba(34,197,94,.13),transparent 55%),linear-gradient(180deg,var(--bg),#03060d 65%,#02040a);line-height:1.55}
-    a{color:inherit;text-decoration:none} .wrap{width:min(1120px,calc(100% - 32px));margin:0 auto}.nav{position:sticky;top:0;z-index:10;backdrop-filter:blur(14px);background:rgba(5,9,20,.72);border-bottom:1px solid rgba(255,255,255,.06)}.nav-inner{height:64px;display:flex;align-items:center;justify-content:space-between}.brand{display:flex;gap:10px;align-items:center;font-weight:800;letter-spacing:.2px}.mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--cyan),var(--green));box-shadow:0 0 28px rgba(103,232,249,.25)}.nav-links{display:flex;gap:18px;color:var(--muted);font-size:14px}.nav-links a:hover{color:var(--ink)}
-    .hero{padding:82px 0 46px}.eyebrow{display:inline-flex;gap:8px;align-items:center;padding:7px 10px;border:1px solid rgba(103,232,249,.35);border-radius:999px;color:var(--cyan);background:rgba(103,232,249,.08);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}.hero-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:34px;align-items:center;margin-top:20px}.hero h1{font-size:clamp(42px,7vw,82px);line-height:.9;margin:18px 0 18px;letter-spacing:-.06em}.hero p{color:var(--muted);font-size:18px;max-width:680px}.actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:26px}.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:12px 16px;border-radius:12px;font-weight:800;border:1px solid var(--line);background:rgba(255,255,255,.06)}.btn.primary{background:linear-gradient(135deg,var(--cyan),var(--green));color:#021015;border:0}.btn:hover{transform:translateY(-1px)}
-    .terminal{background:#050914;border:1px solid var(--line);border-radius:20px;padding:18px;box-shadow:var(--shadow);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;color:#d7e3f7}.terminal .top{display:flex;gap:7px;margin-bottom:14px}.dot{width:10px;height:10px;border-radius:999px;background:#334155}.dot:nth-child(1){background:#fb7185}.dot:nth-child(2){background:#fbbf24}.dot:nth-child(3){background:#22c55e}.ok{color:var(--green)}.cy{color:var(--cyan)}.muted{color:var(--muted)}
-    section{padding:46px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:18px}.section-head h2{font-size:clamp(28px,4vw,44px);margin:0;letter-spacing:-.04em}.section-head p{margin:0;color:var(--muted);max-width:560px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.card{background:linear-gradient(180deg,rgba(16,31,52,.88),rgba(8,21,38,.88));border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.22)}.card h3{margin:8px 0 6px}.card p{color:var(--muted);margin:0}.status{display:inline-flex;align-items:center;gap:7px;color:var(--green);font-size:12px;font-weight:900;text-transform:uppercase;letter-spacing:.08em}.pulse{width:8px;height:8px;border-radius:999px;background:var(--green);box-shadow:0 0 20px rgba(34,197,94,.75)}
-    .gateway{display:grid;grid-template-columns:.85fr 1.15fr;gap:18px}.gateway .big{background:linear-gradient(135deg,rgba(103,232,249,.12),rgba(34,197,94,.10));border:1px solid rgba(103,232,249,.25)}.api{padding:14px;border-radius:14px;background:#050914;border:1px solid var(--line);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow:auto}.shape{white-space:pre;background:#050914;border:1px solid var(--line);border-radius:18px;padding:18px;color:#dbeafe;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow:auto}
-    .media-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}.media{overflow:hidden;padding:0}.media img{width:100%;height:260px;object-fit:cover;display:block;border-bottom:1px solid var(--line)}.media .cap{padding:14px}.video-placeholder{height:260px;display:flex;align-items:center;justify-content:center;background:radial-gradient(circle at center,rgba(103,232,249,.20),#050914 62%);border-bottom:1px solid var(--line);font-weight:900;color:var(--cyan)}
-    .products{display:grid;grid-template-columns:1fr 1fr;gap:14px}.product{min-height:190px;display:flex;flex-direction:column;justify-content:space-between}.product .link{margin-top:18px;color:var(--cyan);font-weight:900}.three{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.quote{font-size:clamp(24px,4vw,42px);line-height:1.05;letter-spacing:-.05em;margin:0}.footer{padding:42px 0 60px;color:var(--muted);border-top:1px solid rgba(255,255,255,.06);margin-top:40px}.registry{display:flex;flex-wrap:wrap;gap:8px}.pill{border:1px solid var(--line);background:rgba(255,255,255,.05);border-radius:999px;padding:8px 10px;font-size:13px;color:var(--muted)}
-    @media(max-width:850px){.hero-grid,.gateway,.grid,.products,.three,.media-grid{grid-template-columns:1fr}.nav-links{display:none}.hero{padding-top:56px}.media img,.video-placeholder{height:220px}}
-  </style>
-</head>
-<body>
-  <nav class="nav"><div class="wrap nav-inner"><a class="brand" href="#top"><span class="mark"></span><span>SageWire</span></a><div class="nav-links"><a href="#gateway">Gateway</a><a href="#services">Services</a><a href="#apps">Apps</a><a href="#media">Media</a><a href="#layers">Layers</a><a href="#map">MAP · OPS · SOP</a></div></div></nav>
-  <main id="top">
-    <section class="hero"><div class="wrap hero-grid"><div><span class="eyebrow">Live service platform · Built in Appalachia</span><h1>Walk. Work. Talk.<br>SageWire handles the rest.</h1><p>SageWire is a modular AI service platform for real-world applications. It connects speech, location, weather, AI, logging, and future services through one reusable Gateway.</p><div class="actions"><a class="btn primary" href="https://api.sagewire.dev/health">Gateway Greenlight</a><a class="btn" href="https://herdmate.ag">HerdMate.ag</a><a class="btn" href="https://sagewiresyndicate.com">SageWire Syndicate</a></div></div><div class="terminal"><div class="top"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div><div><span class="muted">$ curl https://api.sagewire.dev/health</span><br>{<br>&nbsp;&nbsp;"service": <span class="cy">"sagewire-api-gateway"</span>,<br>&nbsp;&nbsp;"status": <span class="ok">"ok"</span>,<br>&nbsp;&nbsp;"version": <span class="cy">"1.0"</span><br>}<br><br><span class="ok">Gateway greenlight confirmed.</span></div></div></div></section>
 
-    <section id="gateway"><div class="wrap gateway"><div class="card big"><span class="status"><span class="pulse"></span>Online</span><h2>SageWire Gateway</h2><p>The central routing layer for the platform. Applications call the Gateway; the Gateway coordinates reusable services such as speech, transcription, location, weather, shared memory, domain intelligence, logging, and future capabilities.</p><div class="api" style="margin-top:18px">https://api.sagewire.dev</div><div class="actions"><a class="btn primary" href="https://api.sagewire.dev/health">Open Health</a><a class="btn" href="#map">View MAP · OPS · SOP</a></div></div><div class="shape">Applications
-      │
-      ▼
-SageWire Gateway
-      │
- ┌────┼────┬────┬────┐
- ▼    ▼    ▼    ▼
-STT  TTS  LOC   WX
- │    │    │    │
- ├────┴────┴────┤
- ▼              ▼
-RAG            DAVE
-      │
-      ▼
-Field tools, ranch apps, documents, devices</div></div></section>
+@app.get("/health")
+async def health_standard():
+    """SageWire-standard health check (matches WX/TTS/STT/LOC pattern)."""
+    return {
+        "status": "ok",
+        "service": "DAVE",
+        "version": "4.0.0",
+        "vet_docs": vet_collection.count(),
+        "rag_service": RAG_SERVICE_URL or "not configured",
+    }
 
-    <section id="services"><div class="wrap"><div class="section-head"><h2>Core Services</h2><p>Independent services that can be reused by any SageWire-powered application.</p></div><div class="grid"><div class="card"><span class="status"><span class="pulse"></span>Online</span><h3>Gateway</h3><p>Central API router and future control plane.</p></div><div class="card"><span class="status"><span class="pulse"></span>Online</span><h3>EmberVox · TTS</h3><p>Text-to-speech voice generation for spoken replies.</p></div><div class="card"><span class="status"><span class="pulse"></span>Online</span><h3>STT</h3><p>Speech-to-text transcription for voice sessions.</p></div><div class="card"><span class="status"><span class="pulse"></span>Online</span><h3>LOC</h3><p>Location stamps: GPS, elevation, accuracy, heading, speed, and map links.</p></div><div class="card"><span class="status"><span class="pulse"></span>Online</span><h3>WX</h3><p>Weather context by latitude and longitude.</p></div><div class="card"><span class="status"><span class="pulse"></span>Online</span><h3>RAG · Shared Memory</h3><p>Shared document memory, semantic search, and question answering for SageWire applications.</p></div><div class="card"><span class="status"><span class="pulse"></span>Online</span><h3>DAVE · Vet AI</h3><p>AI veterinary assistant for cattle operations. Reads live animal records and veterinary references to provide field guidance and recommendations.</p></div><div class="card"><span class="status"><span class="pulse"></span>Online</span><h3>PTT</h3><p>Push-to-talk recording, session handling, and headset workflow.</p></div></div></div></section>
+@app.get("/vet/health")
+async def health():
+    return {"status": "ok", "service": "HerdMate DAVE Vet AI v4"}
 
-    <section id="apps"><div class="wrap"><div class="section-head"><h2>Built With SageWire</h2><p>Applications powered by the service platform.</p></div><div class="products"><div class="card product"><div><h3>🎧 PTT Field Logger</h3><p>A hands-free AI field assistant. Press a headset button, speak naturally, and SageWire records audio, transcribes it, captures location and weather, replies with AI, speaks back through the headset, and logs the session.</p></div><a class="link" href="https://headset.herdmate.ag">Open Headset App →</a></div><div class="card product"><div><h3>🌾 HerdMate.ag</h3><p>A livestock and ranch management platform. HerdMate can use SageWire services for field notes, location, weather, voice capture, AI summaries, and future RFID workflows.</p></div><a class="link" href="https://herdmate.ag">Visit HerdMate.ag →</a></div></div></div></section>
-
-    <section id="media"><div class="wrap"><div class="section-head"><h2>Field Proof</h2><p>Photos and videos can live here. Drop files into the repo's <code>assets</code> folder and swap the links later.</p></div><div class="media-grid"><div class="card media"><img src="assets/ptt-home.jpg" alt="PTT Field Logger connected to headset"><div class="cap"><strong>Connected headset</strong><p>3M Pro-Comms connected through the PTT app.</p></div></div><div class="card media"><img src="assets/ptt-log.jpg" alt="PTT transcript and audio log"><div class="cap"><strong>Session record</strong><p>Transcript, audio playback, and logged field session.</p></div></div><div class="card media"><img src="assets/ptt-context.jpg" alt="Location and weather context"><div class="cap"><strong>Context layer</strong><p>LOC and WX attached to a voice session.</p></div></div><div class="card media"><div class="video-placeholder">VIDEO SLOT</div><div class="cap"><strong>Demo video</strong><p>Add a headset walk-and-talk demo here when ready.</p></div></div><div class="card media"><div class="video-placeholder">VIDEO SLOT</div><div class="cap"><strong>Service walkthrough</strong><p>Add a Gateway or MAP/OPS/SOP overview here.</p></div></div><div class="card media"><div class="video-placeholder">PHOTO SLOT</div><div class="cap"><strong>Field hardware</strong><p>Add headset, tags, reader, ranch, or build photos here.</p></div></div></div></div></section>
-
-    <section id="layers"><div class="wrap"><div class="section-head"><h2>Platform Layers</h2><p>SageWire separates applications, routing, reusable services, and domain intelligence so every app can stay lighter.</p></div><div class="grid"><div class="card"><h3>Applications</h3><p>Headset, HerdMate, AI Filing Cabinet, and future tools where people capture real-world work.</p></div><div class="card"><h3>Gateway</h3><p>The front door for platform traffic, orchestration, service routing, and future API keys.</p></div><div class="card"><h3>Core Services</h3><p>STT, EmberVox, LOC, WX, and RAG provide reusable capabilities across applications.</p></div><div class="card"><h3>Domain Intelligence</h3><p>DAVE and future specialized assistants apply SageWire services to specific fields and workflows.</p></div><div class="card"><h3>Shared Memory</h3><p>Documents, transcripts, manuals, and field notes can become searchable knowledge through RAG.</p></div><div class="card"><h3>Devices</h3><p>Headsets, phones, RFID readers, scanners, and future sensors become clients of the same platform.</p></div></div></div></section>
-
-    <section id="map"><div class="wrap"><div class="section-head"><h2>MAP · OPS · SOP</h2><p>The operating language of the SageWire platform.</p></div><div class="three"><div class="card"><h3>MAP</h3><p>What exists: services, applications, domains, servers, owners, and endpoints.</p></div><div class="card"><h3>OPS</h3><p>What is happening: health checks, logs, deployments, request counts, and service status.</p></div><div class="card"><h3>SOP</h3><p>How to build: repeatable playbooks for DNS, Docker, Coolify, Gateway wiring, and tests.</p></div></div></div></section>
-
-    <section><div class="wrap"><div class="card"><p class="quote">A product may depend on a service.<br>A service must never depend on a product.</p><p style="color:var(--muted);margin-top:16px">This rule keeps applications lighter, services reusable, and the platform easier to grow.</p><p style="color:var(--muted);margin-top:10px">Knowledge enters through applications, becomes reusable through services, and is available to every SageWire application.</p></div></div></section>
-
-    <section><div class="wrap"><div class="section-head"><h2>Service Registry</h2><p>Current public endpoints.</p></div><div class="card registry"><a class="pill" href="https://api.sagewire.dev/health">api.sagewire.dev</a><a class="pill" href="https://tts.sagewire.dev/health">tts.sagewire.dev</a><a class="pill" href="https://stt.sagewire.dev/health">stt.sagewire.dev</a><a class="pill" href="https://loc.sagewire.dev/health">loc.sagewire.dev</a><a class="pill" href="https://weather.herdmate.ag/health">weather.herdmate.ag</a><a class="pill" href="https://rag.sagewire.dev/health">rag.sagewire.dev</a><a class="pill" href="https://dave.sagewire.dev/health">dave.sagewire.dev</a><a class="pill" href="https://headset.herdmate.ag/health">headset.herdmate.ag</a></div></div></section>
-  </main>
-  <footer class="footer"><div class="wrap">SageWire — Gateway to the Forge. Built from Steubenville, Ohio, the original gateway west of the Appalachians.</div></footer>
-</body>
-</html>
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
