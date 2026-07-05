@@ -304,6 +304,25 @@ def _clean_row(row_dict: dict) -> dict:
         out[h] = v
     return out
 
+def _parse_date_for_sort(date_str: str):
+    """
+    Parse a date for ranking. Handles the mixed formats that show up across
+    tabs: '2024-09-27 00:00:00' (Ranch Tracker) and '5/27/2026' (Calf Tracker).
+    Returns a comparable date; unknown/blank sorts oldest.
+    """
+    from datetime import datetime as _dt
+    s = str(date_str).strip()
+    if not s:
+        return _dt(1900, 1, 1)
+    # strip a trailing time if present
+    s = s.split(" ")[0]
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y/%m/%d"):
+        try:
+            return _dt.strptime(s, fmt)
+        except ValueError:
+            continue
+    return _dt(1900, 1, 1)
+
 def _tab_priority(tab: str) -> int:
     """
     Higher = more authoritative as THE animal record.
@@ -404,9 +423,9 @@ def find_animal(sheet_id: str, tag_identifier: str):
     # outrank the actual Ranch Tracker / Calf Tracker animal record.
     def _rank_key(m):
         return (
-            _tab_priority(m.get("source", "")),
-            _is_active_status(m.get("status", "")),
-            m.get("_date", ""),
+            _is_active_status(m.get("status", "")),      # live beats sold/dead
+            _parse_date_for_sort(m.get("_date", "")),    # newest animal wins (real date compare)
+            _tab_priority(m.get("source", "")),          # tie-breaker only
         )
     all_matches.sort(key=_rank_key, reverse=True)
 
