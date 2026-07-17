@@ -705,8 +705,8 @@ def _normalize_header(value: str) -> str:
     Normalize a Sheet column header for flexible matching.
 
     Examples:
-      "Tag #"                    -> "tag"
-      "Birth Weight (lbs)"       -> "birthweightlbs"
+      "Tag #"                      -> "tag"
+      "Birth Weight (lbs)"         -> "birthweightlbs"
       "Body Condition Score (BCS)" -> "bodyconditionscorebcs"
     """
     return "".join(
@@ -742,19 +742,270 @@ def _animal_field(fields: dict, *possible_headers: str) -> str:
     return ""
 
 
-def _sentinel_animal_record(animal: dict, lookup_epc: str) -> dict:
+def _relationship_identity(fields: dict, reference: str) -> dict:
+    """
+    Return all useful identities for a related animal.
+
+    LIN remains the permanent record identity.
+    ID is the internal database key.
+    UHF/RFID are machine-readable identifiers.
+    Tag is the human-facing field identifier.
+    """
+    return {
+        "reference": str(reference or "").strip(),
+        "id": _animal_field(
+            fields,
+            "ID",
+            "Animal ID",
+            "Record ID"
+        ),
+        "tag": _animal_field(
+            fields,
+            "New Tag #",
+            "Tag #",
+            "Calf Tag",
+            "Tag Number",
+            "Tag"
+        ),
+        "display_id": _animal_field(
+            fields,
+            "DisplayID",
+            "Display ID",
+            "IDCalf"
+        ),
+        "uhf": _animal_field(
+            fields,
+            "UHF#",
+            "UHF #",
+            "UHF",
+            "EPC",
+            "EPC#"
+        ),
+        "rfid": _animal_field(
+            fields,
+            "RFID#",
+            "RFID #",
+            "RFID"
+        ),
+        "lin": _animal_field(
+            fields,
+            "Livestock Identification Number (LIN)",
+            "Livestock Identification Number",
+            "LIN"
+        ),
+        "status": _animal_field(
+            fields,
+            "Status"
+        ),
+        "resolved": True
+    }
+
+
+def _relationship_match_values(fields: dict) -> list:
+    """
+    Values that may identify a Ranch Tracker row.
+
+    Row ID is checked, but this also survives a future move where the
+    relationship reference becomes a LIN, UHF, RFID or visible tag.
+    """
+    values = [
+        _animal_field(fields, "ID", "Animal ID", "Record ID"),
+        _animal_field(
+            fields,
+            "Livestock Identification Number (LIN)",
+            "Livestock Identification Number",
+            "LIN"
+        ),
+        _animal_field(fields, "UHF#", "UHF #", "UHF", "EPC", "EPC#"),
+        _animal_field(fields, "RFID#", "RFID #", "RFID"),
+        _animal_field(
+            fields,
+            "New Tag #",
+            "Tag #",
+            "Calf Tag",
+            "Tag Number",
+            "Tag"
+        ),
+        _animal_field(fields, "DisplayID", "Display ID")
+    ]
+
+    return [
+        _norm_tag(value)
+        for value in values
+        if str(value or "").strip()
+    ]
+
+
+def _resolve_related_animals(sheet_id: str, animal: dict) -> dict:
+    """
+    Resolve Dam # and Sire # against Ranch Tracker.
+
+    Current HerdMate rows use the Ranch Tracker ID as a foreign key:
+      Dam #  = 2715 -> Tag # 3905B/339
+      Sire # = 3263 -> Tag # 6794J
+
+    The resolver also accepts LIN/UHF/RFID/tag references so the data model
+    can evolve without replacing this endpoint again.
+    """
+    fields = animal.get("fields", {}) if isinstance(animal, dict) else {}
+
+    dam_reference = _animal_field(
+        fields,
+        "Dam #",
+        "Dam ID",
+        "Dam",
+        "Cow ID",
+        "Cow #",
+        "Cow Tag"
+    )
+
+    sire_reference = _animal_field(
+        fields,
+        "Sire #",
+        "Sire ID",
+        "Sire",
+        "Bull ID",
+        "Bull #",
+        "Bull Tag"
+    )
+
+    relationships = {
+        "dam": {
+            "reference": dam_reference,
+            "id": dam_reference,
+            "tag": "",
+            "display_id": "",
+            "uhf": "",
+            "rfid": "",
+            "lin": "",
+            "status": "",
+            "resolved": False
+        },
+        "sire": {
+            "reference": sire_reference,
+            "id": sire_reference,
+            "tag": "",
+            "display_id": "",
+            "uhf": "",
+            "rfid": "",
+            "lin": "",
+            "status": "",
+            "resolved": False
+        }
+    }
+
+    wanted = {
+        "dam": _norm_tag(dam_reference),
+        "sire": _norm_tag(sire_reference)
+    }
+
+    if not wanted["dam"] and not wanted["sire"]:
+        return relationships
+
+    token = get_service_token()
+    if not token:
+        return relationships
+
+    try:
+        ranch_data = sheets_get(token, sheet_id, "Ranch Tracker!A:CZ")
+    except Exception as exception:
+        print(f"[relationships] Ranch Tracker lookup failed: {exception}")
+        return relationships
+
+    if not ranch_data or len(ranch_data) < 2:
+        return relationships
+
+    headers = ranch_data[0]
+
+    for row in ranch_data[1:]:
+        if not row:
+            continue
+
+        row_dict = dict(
+            zip(
+                headers,
+                row + [""] * max(0, len(headers) - len(row))
+            )
+        )
+        row_fields = _clean_row(row_dict)
+        match_values = _relationship_match_values(row_fields)
+
+        for role in ("dam", "sire"):
+            reference = wanted[role]
+
+            if (
+                reference
+                and not relationships[role]["resolved"]
+                and reference in match_values
+            ):
+                relationships[role] = _relationship_identity(
+                    row_fields,
+                    relationships[role]["reference"]
+                )
+
+        if relationships["dam"]["resolved"] and relationships["sire"]["resolved"]:
+            break
+
+    return relationships
+
+
+def _relationship_display(identity: dict, fallback: str) -> str:
+    """
+    Human display order:
+      visible ear tag -> LIN -> UHF -> RFID -> original reference
+
+    Computers still receive every identifier in separate response fields.
+    """
+    return (
+        str(identity.get("tag", "")).strip()
+        or str(identity.get("lin", "")).strip()
+        or str(identity.get("uhf", "")).strip()
+        or str(identity.get("rfid", "")).strip()
+        or str(fallback or "").strip()
+    )
+
+
+def _sentinel_animal_record(
+    animal: dict,
+    lookup_epc: str,
+    relationships: Optional[dict] = None
+) -> dict:
     """
     Convert DAVE's dynamic animal result into the common fields Sentinel
     displays, while preserving the complete dynamic Google Sheet row.
     """
     fields = animal.get("fields", {})
+    relationships = relationships or {}
+
+    dam_identity = relationships.get("dam", {})
+    sire_identity = relationships.get("sire", {})
+
+    raw_dam = _animal_field(
+        fields,
+        "Dam #",
+        "Dam ID",
+        "Dam",
+        "Cow ID",
+        "Cow #",
+        "Cow Tag"
+    )
+
+    raw_sire = _animal_field(
+        fields,
+        "Sire #",
+        "Sire ID",
+        "Sire",
+        "Bull ID",
+        "Bull #",
+        "Bull Tag"
+    )
 
     tag = _animal_field(
         fields,
+        "New Tag #",
         "Tag #",
         "Calf Tag",
         "Cow Tag",
-        "New Tag #",
         "Tag Number",
         "Tag"
     )
@@ -812,37 +1063,21 @@ def _sentinel_animal_record(animal: dict, lookup_epc: str) -> dict:
 
     return {
         "lookup_epc": lookup_epc,
+
+        # The animal's own identities.
         "tag": tag or str(animal.get("tag", "")).strip(),
         "display_id": display_id,
         "uhf": uhf,
         "rfid": rfid,
         "lin": lin,
+
         "source": str(animal.get("source", "")).strip(),
         "status": status,
 
-        "sex": _animal_field(
-            fields,
-            "Sex",
-            "Calf Sex"
-        ),
-
-        "type": _animal_field(
-            fields,
-            "Type",
-            "Calf Type",
-            "Category"
-        ),
-
-        "breed": _animal_field(
-            fields,
-            "Breed"
-        ),
-
-        "color": _animal_field(
-            fields,
-            "Color",
-            "Calf Color"
-        ),
+        "sex": _animal_field(fields, "Sex", "Calf Sex"),
+        "type": _animal_field(fields, "Type", "Calf Type", "Category"),
+        "breed": _animal_field(fields, "Breed"),
+        "color": _animal_field(fields, "Color", "Calf Color"),
 
         "birth_date": _animal_field(
             fields,
@@ -853,21 +1088,9 @@ def _sentinel_animal_record(animal: dict, lookup_epc: str) -> dict:
         ),
 
         "date": str(animal.get("_date", "")).strip(),
-
-        "age": _animal_field(
-            fields,
-            "Age"
-        ),
-
-        "pasture": _animal_field(
-            fields,
-            "Pasture"
-        ),
-
-        "herd": _animal_field(
-            fields,
-            "Herd"
-        ),
+        "age": _animal_field(fields, "Age"),
+        "pasture": _animal_field(fields, "Pasture"),
+        "herd": _animal_field(fields, "Herd"),
 
         "weight": _animal_field(
             fields,
@@ -889,24 +1112,27 @@ def _sentinel_animal_record(animal: dict, lookup_epc: str) -> dict:
             "Weaning Weight"
         ),
 
-        "dam": _animal_field(
-            fields,
-            "Dam #",
-            "Dam",
-            "Cow Tag",
-            "Cow #"
-        ),
+        # Human-facing parent values. The current Android client already reads
+        # these two fields, so it will immediately show 3905B/339 and 6794J.
+        "dam": _relationship_display(dam_identity, raw_dam),
+        "sire": _relationship_display(sire_identity, raw_sire),
 
-        "sire": _animal_field(
-            fields,
-            "Sire #",
-            "Sire"
-        ),
+        # Preserve every parent identifier for later UI and lineage work.
+        "dam_id": str(dam_identity.get("id", "") or raw_dam).strip(),
+        "dam_tag": str(dam_identity.get("tag", "")).strip(),
+        "dam_display_id": str(dam_identity.get("display_id", "")).strip(),
+        "dam_uhf": str(dam_identity.get("uhf", "")).strip(),
+        "dam_rfid": str(dam_identity.get("rfid", "")).strip(),
+        "dam_lin": str(dam_identity.get("lin", "")).strip(),
 
-        "due_date": _animal_field(
-            fields,
-            "Due Date"
-        ),
+        "sire_id": str(sire_identity.get("id", "") or raw_sire).strip(),
+        "sire_tag": str(sire_identity.get("tag", "")).strip(),
+        "sire_display_id": str(sire_identity.get("display_id", "")).strip(),
+        "sire_uhf": str(sire_identity.get("uhf", "")).strip(),
+        "sire_rfid": str(sire_identity.get("rfid", "")).strip(),
+        "sire_lin": str(sire_identity.get("lin", "")).strip(),
+
+        "due_date": _animal_field(fields, "Due Date"),
 
         "palp_result": _animal_field(
             fields,
@@ -930,10 +1156,7 @@ def _sentinel_animal_record(animal: dict, lookup_epc: str) -> dict:
             "Dam BCS"
         ),
 
-        "disposition": _animal_field(
-            fields,
-            "Disposition"
-        ),
+        "disposition": _animal_field(fields, "Disposition"),
 
         "notes": _animal_field(
             fields,
@@ -946,8 +1169,7 @@ def _sentinel_animal_record(animal: dict, lookup_epc: str) -> dict:
         "_ambiguous": bool(animal.get("_ambiguous")),
         "_other_matches": animal.get("_other_matches", []),
 
-        # Preserve the complete dynamic record. Sentinel can use more of these
-        # fields later without changing DAVE's lookup architecture.
+        # Preserve the complete dynamic record.
         "fields": fields
     }
 
@@ -958,7 +1180,7 @@ async def animal_health():
         "status": "ok",
         "service": "HerdMate Sentinel Animal Lookup",
         "dave_service": True,
-        "version": "1.0.0"
+        "version": "1.1.0"
     }
 
 
@@ -1000,7 +1222,13 @@ async def animal_lookup(request: AnimalLookupRequest):
             "timestamp": timestamp
         }
 
-    sentinel_record = _sentinel_animal_record(animal, epc)
+    relationships = _resolve_related_animals(sheet_id, animal)
+
+    sentinel_record = _sentinel_animal_record(
+        animal,
+        epc,
+        relationships
+    )
 
     return {
         "found": True,
@@ -1012,26 +1240,6 @@ async def animal_lookup(request: AnimalLookupRequest):
         "timestamp": timestamp
     }
 
-@app.get("/vet/status")
-async def vet_status():
-    return {
-        "status": "online",
-        "vet_knowledge_docs": vet_collection.count(),
-        "field_memory_docs": memory_collection.count(),
-        "ready": vet_collection.count() > 0,
-        "service_account": os.path.exists(CREDENTIALS_FILE)
-    }
-
-@app.get("/health")
-async def health_standard():
-    """SageWire-standard health check (matches WX/TTS/STT/LOC pattern)."""
-    return {
-        "status": "ok",
-        "service": "DAVE",
-        "version": "4.0.0",
-        "vet_docs": vet_collection.count(),
-        "rag_service": RAG_SERVICE_URL or "not configured",
-    }
 
 @app.get("/vet/health")
 async def health():
