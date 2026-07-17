@@ -1240,6 +1240,27 @@ async def animal_lookup(request: AnimalLookupRequest):
         "timestamp": timestamp
     }
 
+@app.get("/vet/status")
+async def vet_status():
+    return {
+        "status": "online",
+        "vet_knowledge_docs": vet_collection.count(),
+        "field_memory_docs": memory_collection.count(),
+        "ready": vet_collection.count() > 0,
+        "service_account": os.path.exists(CREDENTIALS_FILE)
+    }
+
+
+@app.get("/health")
+async def health_standard():
+    """SageWire-standard health check."""
+    return {
+        "status": "ok",
+        "service": "DAVE",
+        "version": "4.0.0",
+        "vet_docs": vet_collection.count(),
+        "rag_service": RAG_SERVICE_URL or "not configured",
+    }
 
 @app.get("/vet/health")
 async def health():
