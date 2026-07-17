@@ -692,6 +692,326 @@ async def ask_vet(q: VetQuestion):
         animal_context=animal_record
     )
 
+# ── SENTINEL ANIMAL LOOKUP ──
+
+class AnimalLookupRequest(BaseModel):
+    epc: str
+    herdmate_sheet_id: str
+    operation: Optional[str] = "HerdMate"
+
+
+def _normalize_header(value: str) -> str:
+    """
+    Normalize a Sheet column header for flexible matching.
+
+    Examples:
+      "Tag #"                    -> "tag"
+      "Birth Weight (lbs)"       -> "birthweightlbs"
+      "Body Condition Score (BCS)" -> "bodyconditionscorebcs"
+    """
+    return "".join(
+        character
+        for character in str(value).strip().lower()
+        if character.isalnum()
+    )
+
+
+def _animal_field(fields: dict, *possible_headers: str) -> str:
+    """
+    Find the first populated value whose header matches one of the supplied
+    names. Header punctuation, spaces and capitalization are ignored.
+    """
+    if not isinstance(fields, dict):
+        return ""
+
+    normalized_fields = {}
+
+    for header, value in fields.items():
+        normalized_header = _normalize_header(header)
+        clean_value = "" if value is None else str(value).strip()
+
+        if normalized_header and clean_value:
+            normalized_fields[normalized_header] = clean_value
+
+    for possible_header in possible_headers:
+        normalized_header = _normalize_header(possible_header)
+
+        if normalized_header in normalized_fields:
+            return normalized_fields[normalized_header]
+
+    return ""
+
+
+def _sentinel_animal_record(animal: dict, lookup_epc: str) -> dict:
+    """
+    Convert DAVE's dynamic animal result into the common fields Sentinel
+    displays, while preserving the complete dynamic Google Sheet row.
+    """
+    fields = animal.get("fields", {})
+
+    tag = _animal_field(
+        fields,
+        "Tag #",
+        "Calf Tag",
+        "Cow Tag",
+        "New Tag #",
+        "Tag Number",
+        "Tag"
+    )
+
+    display_id = _animal_field(
+        fields,
+        "DisplayID",
+        "Display ID",
+        "IDCalf",
+        "Animal ID",
+        "ID"
+    )
+
+    uhf = _animal_field(
+        fields,
+        "UHF#",
+        "UHF #",
+        "UHF",
+        "EPC",
+        "EPC#"
+    )
+
+    rfid = _animal_field(
+        fields,
+        "RFID#",
+        "RFID #",
+        "RFID"
+    )
+
+    lin = (
+        str(animal.get("lin", "")).strip()
+        or _animal_field(
+            fields,
+            "Livestock Identification Number (LIN)",
+            "Livestock Identification Number",
+            "LIN"
+        )
+    )
+
+    photo = (
+        str(animal.get("photo", "")).strip()
+        or _animal_field(
+            fields,
+            "Photo",
+            "Picture",
+            "Image",
+            "Photo Album"
+        )
+    )
+
+    status = (
+        str(animal.get("status", "")).strip()
+        or _animal_field(fields, "Status")
+    )
+
+    return {
+        "lookup_epc": lookup_epc,
+        "tag": tag or str(animal.get("tag", "")).strip(),
+        "display_id": display_id,
+        "uhf": uhf,
+        "rfid": rfid,
+        "lin": lin,
+        "source": str(animal.get("source", "")).strip(),
+        "status": status,
+
+        "sex": _animal_field(
+            fields,
+            "Sex",
+            "Calf Sex"
+        ),
+
+        "type": _animal_field(
+            fields,
+            "Type",
+            "Calf Type",
+            "Category"
+        ),
+
+        "breed": _animal_field(
+            fields,
+            "Breed"
+        ),
+
+        "color": _animal_field(
+            fields,
+            "Color",
+            "Calf Color"
+        ),
+
+        "birth_date": _animal_field(
+            fields,
+            "Birth Date",
+            "Date of Birth",
+            "DOB",
+            "Date"
+        ),
+
+        "date": str(animal.get("_date", "")).strip(),
+
+        "age": _animal_field(
+            fields,
+            "Age"
+        ),
+
+        "pasture": _animal_field(
+            fields,
+            "Pasture"
+        ),
+
+        "herd": _animal_field(
+            fields,
+            "Herd"
+        ),
+
+        "weight": _animal_field(
+            fields,
+            "Weight (lbs)",
+            "Weight",
+            "Current Weight",
+            "Latest Weight"
+        ),
+
+        "birth_weight": _animal_field(
+            fields,
+            "Birth Weight (lbs)",
+            "Birth Weight"
+        ),
+
+        "weaning_weight": _animal_field(
+            fields,
+            "Weaning Weight (lbs)",
+            "Weaning Weight"
+        ),
+
+        "dam": _animal_field(
+            fields,
+            "Dam #",
+            "Dam",
+            "Cow Tag",
+            "Cow #"
+        ),
+
+        "sire": _animal_field(
+            fields,
+            "Sire #",
+            "Sire"
+        ),
+
+        "due_date": _animal_field(
+            fields,
+            "Due Date"
+        ),
+
+        "palp_result": _animal_field(
+            fields,
+            "Palp. Result",
+            "Palp Result",
+            "Palpation Result"
+        ),
+
+        "months_preg": _animal_field(
+            fields,
+            "Mth. Preg.",
+            "Months Pregnant",
+            "Months Preg"
+        ),
+
+        "bcs": _animal_field(
+            fields,
+            "Body Condition Score (BCS)",
+            "Body Condition Score",
+            "BCS",
+            "Dam BCS"
+        ),
+
+        "disposition": _animal_field(
+            fields,
+            "Disposition"
+        ),
+
+        "notes": _animal_field(
+            fields,
+            "Notes",
+            "Calving Notes"
+        ),
+
+        "photo": photo,
+
+        "_ambiguous": bool(animal.get("_ambiguous")),
+        "_other_matches": animal.get("_other_matches", []),
+
+        # Preserve the complete dynamic record. Sentinel can use more of these
+        # fields later without changing DAVE's lookup architecture.
+        "fields": fields
+    }
+
+
+@app.get("/animal/health")
+async def animal_health():
+    return {
+        "status": "ok",
+        "service": "HerdMate Sentinel Animal Lookup",
+        "dave_service": True,
+        "version": "1.0.0"
+    }
+
+
+@app.post("/animal/lookup")
+async def animal_lookup(request: AnimalLookupRequest):
+    epc = request.epc.strip()
+    sheet_id = request.herdmate_sheet_id.strip()
+
+    if not epc:
+        raise HTTPException(
+            status_code=400,
+            detail="EPC is required"
+        )
+
+    if not sheet_id:
+        raise HTTPException(
+            status_code=400,
+            detail="herdmate_sheet_id is required"
+        )
+
+    try:
+        animal = find_animal(sheet_id, epc)
+    except Exception as exception:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Animal lookup failed: {exception}"
+        ) from exception
+
+    timestamp = datetime.now().isoformat()
+
+    if not animal:
+        return {
+            "found": False,
+            "epc": epc,
+            "operation": request.operation or "HerdMate",
+            "animal": None,
+            "ambiguous": False,
+            "other_matches": [],
+            "timestamp": timestamp
+        }
+
+    sentinel_record = _sentinel_animal_record(animal, epc)
+
+    return {
+        "found": True,
+        "epc": epc,
+        "operation": request.operation or "HerdMate",
+        "animal": sentinel_record,
+        "ambiguous": bool(animal.get("_ambiguous")),
+        "other_matches": animal.get("_other_matches", []),
+        "timestamp": timestamp
+    }
+
 @app.get("/vet/status")
 async def vet_status():
     return {
