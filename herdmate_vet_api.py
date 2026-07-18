@@ -1180,16 +1180,15 @@ async def animal_health():
         "status": "ok",
         "service": "HerdMate Sentinel Animal Lookup",
         "dave_service": True,
-        "version": "1.1.0"
+        "version": "1.2.0"
     }
-
 
 @app.post("/animal/lookup")
 async def animal_lookup(request: AnimalLookupRequest):
-    epc = request.epc.strip()
+    scanned_epc = request.epc.strip()
     sheet_id = request.herdmate_sheet_id.strip()
 
-    if not epc:
+    if not scanned_epc:
         raise HTTPException(
             status_code=400,
             detail="EPC is required"
@@ -1201,8 +1200,34 @@ async def animal_lookup(request: AnimalLookupRequest):
             detail="herdmate_sheet_id is required"
         )
 
+    # Always try the exact EPC reported by the reader first.
+    lookup_candidates = [scanned_epc]
+
+    # Some HerdMate tags are stored in the Sheet as the final 15 digits,
+    # while the C316H reports a longer 24-digit EPC.
+    #
+    # Example:
+    # scanned: 004252025740086010000015
+    # stored:           740086010000015
+    #
+    # Only use the suffix as a fallback after the exact EPC has been tried.
+    if scanned_epc.isdigit() and len(scanned_epc) > 15:
+        uhf_suffix = scanned_epc[-15:]
+
+        if uhf_suffix not in lookup_candidates:
+            lookup_candidates.append(uhf_suffix)
+
+    animal = None
+    matched_identifier = ""
+
     try:
-        animal = find_animal(sheet_id, epc)
+        for candidate in lookup_candidates:
+            animal = find_animal(sheet_id, candidate)
+
+            if animal:
+                matched_identifier = candidate
+                break
+
     except Exception as exception:
         raise HTTPException(
             status_code=500,
@@ -1214,7 +1239,10 @@ async def animal_lookup(request: AnimalLookupRequest):
     if not animal:
         return {
             "found": False,
-            "epc": epc,
+            "epc": scanned_epc,
+            "matched_identifier": None,
+            "normalized_lookup": False,
+            "lookup_candidates": lookup_candidates,
             "operation": request.operation or "HerdMate",
             "animal": None,
             "ambiguous": False,
@@ -1226,20 +1254,27 @@ async def animal_lookup(request: AnimalLookupRequest):
 
     sentinel_record = _sentinel_animal_record(
         animal,
-        epc,
+        scanned_epc,
         relationships
+    )
+
+    sentinel_record["matched_identifier"] = matched_identifier
+    sentinel_record["normalized_lookup"] = (
+        matched_identifier != scanned_epc
     )
 
     return {
         "found": True,
-        "epc": epc,
+        "epc": scanned_epc,
+        "matched_identifier": matched_identifier,
+        "normalized_lookup": matched_identifier != scanned_epc,
         "operation": request.operation or "HerdMate",
         "animal": sentinel_record,
         "ambiguous": bool(animal.get("_ambiguous")),
         "other_matches": animal.get("_other_matches", []),
         "timestamp": timestamp
     }
-
+  
 @app.get("/vet/status")
 async def vet_status():
     return {
