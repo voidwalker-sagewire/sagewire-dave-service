@@ -108,7 +108,37 @@ def get_service_token():
         print(f"Service account auth error: {e}")
         return None
 
-# ── SIMPLE CACHE ──
+# ── ANIMAL LOOKUP ERRORS + POSITIVE-ONLY CACHE ──
+class SheetsRequestError(RuntimeError):
+    """A Google Sheets request failed before a trustworthy search completed."""
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None, range_name: str = ""):
+        super().__init__(message)
+        self.status_code = status_code
+        self.range_name = range_name
+
+
+class SheetRangeMissing(SheetsRequestError):
+    """The spreadsheet exists, but this optional tab/range does not."""
+
+
+class AnimalLookupUnavailable(RuntimeError):
+    """The sheet could not be searched reliably, so NOT_FOUND would be unsafe."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        loaded_tabs: Optional[list] = None,
+        failed_tabs: Optional[list] = None,
+        missing_tabs: Optional[list] = None,
+    ):
+        super().__init__(message)
+        self.loaded_tabs = loaded_tabs or []
+        self.failed_tabs = failed_tabs or []
+        self.missing_tabs = missing_tabs or []
+
+
 _animal_cache: dict = {}
 CACHE_TTL_SECONDS = 300
 
@@ -118,9 +148,13 @@ def get_cached_animal(key: str):
         record, ts = _animal_cache[key]
         if time.time() - ts < CACHE_TTL_SECONDS:
             return record
+        _animal_cache.pop(key, None)
     return "MISS"
 
 def set_cached_animal(key: str, record):
+    """Cache successful animal records only. Never cache a miss or outage."""
+    if record is None:
+        return
     import time
     _animal_cache[key] = (record, time.time())
 
@@ -169,6 +203,13 @@ class VetAnswer(BaseModel):
 
 # ── GOOGLE SHEETS LOOKUP ──
 def sheets_get(token: str, sheet_id: str, range_name: str):
+    """
+    Read one Google Sheets range.
+
+    IMPORTANT: failures raise an exception. Returning [] is reserved for a
+    successful request whose range truly contains no populated values. This
+    prevents a network/auth/API failure from being misreported as NOT_FOUND.
+    """
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{range_name}"
     try:
         resp = http_requests.get(
@@ -176,14 +217,39 @@ def sheets_get(token: str, sheet_id: str, range_name: str):
             headers={"Authorization": f"Bearer {token}"},
             timeout=10
         )
-        if resp.ok:
-            return resp.json().get("values", [])
-        else:
-            print(f"Sheets error {resp.status_code}: {resp.text[:200]}")
-            return []
     except Exception as e:
-        print(f"Sheets request error: {e}")
-        return []
+        raise SheetsRequestError(
+            f"Google Sheets request failed for {range_name}: {e}",
+            range_name=range_name,
+        ) from e
+
+    if resp.ok:
+        try:
+            return resp.json().get("values", [])
+        except Exception as e:
+            raise SheetsRequestError(
+                f"Google Sheets returned invalid JSON for {range_name}: {e}",
+                status_code=resp.status_code,
+                range_name=range_name,
+            ) from e
+
+    response_text = resp.text or ""
+    short_text = response_text[:500]
+
+    # Optional tabs are allowed to be absent. Google normally reports a
+    # missing tab as HTTP 400 with "Unable to parse range".
+    if resp.status_code == 400 and "unable to parse range" in response_text.lower():
+        raise SheetRangeMissing(
+            f"Sheet tab/range does not exist: {range_name}",
+            status_code=resp.status_code,
+            range_name=range_name,
+        )
+
+    raise SheetsRequestError(
+        f"Google Sheets HTTP {resp.status_code} for {range_name}: {short_text}",
+        status_code=resp.status_code,
+        range_name=range_name,
+    )
 
 def _is_active_status(status: str) -> bool:
     """True if a status string reads as 'currently on the operation'."""
@@ -354,20 +420,15 @@ SEARCHABLE_TABS = [
 
 def find_animal(sheet_id: str, tag_identifier: str):
     """
-    DYNAMIC animal lookup (v4).
+    DYNAMIC animal lookup (v4.1).
 
-    Old behavior (v3.1 and earlier): hardcoded a specific list of column
-    names per tab. Any rename/addition/move in the sheet broke Dave. This
-    version instead:
-      - searches each configured tab,
-      - matches the tag against ANY identifier-looking column (dynamic),
-      - grabs the ENTIRE matching row with all its columns/headers,
-      - ranks duplicates (active first, then newest),
-      - returns the best match plus any other matches for disambiguation,
-      - carries a compact "all fields" dict so the AI sees everything.
-
-    The AI reads the real columns, whatever they're named today. Sheet
-    changes need no code change here.
+    The lookup is deliberately fail-safe:
+      - successful records may be cached for five minutes,
+      - misses are NEVER cached,
+      - missing optional tabs are skipped,
+      - a network/auth/API failure can never become a false NOT_FOUND,
+      - if no match is found and any real tab request failed, the caller gets
+        AnimalLookupUnavailable instead of None.
     """
     if not tag_identifier or not sheet_id:
         return None
@@ -379,60 +440,90 @@ def find_animal(sheet_id: str, tag_identifier: str):
 
     token = get_service_token()
     if not token:
-        return None
+        raise AnimalLookupUnavailable(
+            "Google service-account authentication failed; animal records were not searched"
+        )
 
     tag = str(tag_identifier).strip()
     all_matches = []
+    loaded_tabs = []
+    missing_tabs = []
+    failed_tabs = []
 
     for tab in SEARCHABLE_TABS:
         try:
             # Pull a wide range; Sheets returns only populated columns.
             data = sheets_get(token, sheet_id, f"{tab}!A:CZ")
-            if not data or len(data) < 2:
-                continue
-            headers = data[0]
-            for row in data[1:]:
-                if not row:
-                    continue
-                row_dict = dict(zip(headers, row + [""] * max(0, len(headers) - len(row))))
-                if _row_matches_tag(row_dict, tag):
-                    fields = _clean_row(row_dict)
-                    all_matches.append({
-                        "source": tab,
-                        "tag": tag,
-                        "status": _status_of(row_dict),
-                        "_date": _best_date_value(row_dict),
-                        "photo": _find_photo_path(row_dict),
-                        "lin": _find_lin(row_dict),
-                        "fields": fields,  # the full dynamic record
-                    })
+            loaded_tabs.append(tab)
+        except SheetRangeMissing as e:
+            # A genuinely absent optional tab is not an outage.
+            missing_tabs.append(tab)
+            print(f"[find_animal] optional tab '{tab}' missing: {e}")
+            continue
+        except SheetsRequestError as e:
+            failed_tabs.append({
+                "tab": tab,
+                "status_code": e.status_code,
+                "error": str(e),
+            })
+            print(f"[find_animal] tab '{tab}' failed: {e}")
+            continue
         except Exception as e:
-            # A missing tab (e.g. Bovine Beacon not in this sheet) just gets skipped.
-            print(f"[find_animal] tab '{tab}' skipped: {e}")
+            failed_tabs.append({
+                "tab": tab,
+                "status_code": None,
+                "error": str(e),
+            })
+            print(f"[find_animal] tab '{tab}' failed unexpectedly: {e}")
             continue
 
+        if not data or len(data) < 2:
+            continue
+
+        headers = data[0]
+        for row in data[1:]:
+            if not row:
+                continue
+            row_dict = dict(zip(headers, row + [""] * max(0, len(headers) - len(row))))
+            if _row_matches_tag(row_dict, tag):
+                fields = _clean_row(row_dict)
+                all_matches.append({
+                    "source": tab,
+                    "tag": tag,
+                    "status": _status_of(row_dict),
+                    "_date": _best_date_value(row_dict),
+                    "photo": _find_photo_path(row_dict),
+                    "lin": _find_lin(row_dict),
+                    "fields": fields,
+                })
+
+    # A positive match is trustworthy even if a different optional tab failed.
+    # A negative result is trustworthy only when every real request completed.
     if not all_matches:
-        set_cached_animal(cache_key, None)
+        if failed_tabs or not loaded_tabs:
+            failed_names = ", ".join(item["tab"] for item in failed_tabs) or "all configured tabs"
+            raise AnimalLookupUnavailable(
+                f"HerdMate animal lookup could not complete reliably; failed tabs: {failed_names}",
+                loaded_tabs=loaded_tabs,
+                failed_tabs=failed_tabs,
+                missing_tabs=missing_tabs,
+            )
         return None
 
     # Rank matches. Priority, highest wins:
-    #   1. Is it a primary animal record vs just an event log about the animal?
-    #   2. Active status before inactive/sold.
-    #   3. Most recent date.
-    # A palpation/scrotal log row is an EVENT, not the animal — it must never
-    # outrank the actual Ranch Tracker / Calf Tracker animal record.
+    #   1. Active status before inactive/sold.
+    #   2. Most recent date.
+    #   3. Primary animal tab as a tie-breaker.
     def _rank_key(m):
         return (
-            _is_active_status(m.get("status", "")),      # live beats sold/dead
-            _parse_date_for_sort(m.get("_date", "")),    # newest animal wins (real date compare)
-            _tab_priority(m.get("source", "")),          # tie-breaker only
+            _is_active_status(m.get("status", "")),
+            _parse_date_for_sort(m.get("_date", "")),
+            _tab_priority(m.get("source", "")),
         )
     all_matches.sort(key=_rank_key, reverse=True)
 
     best = all_matches[0]
 
-    # If multiple records share this tag (across tabs OR reused across years),
-    # attach the others so DAVE can disambiguate instead of guessing.
     if len(all_matches) > 1:
         best = dict(best)
         best["_ambiguous"] = True
@@ -441,12 +532,12 @@ def find_animal(sheet_id: str, tag_identifier: str):
                 "source": m.get("source"),
                 "status": m.get("status") or "unknown",
                 "date": m.get("_date") or "unknown date",
-                # a couple of human-readable hints pulled dynamically
                 "hint": _short_hint(m.get("fields", {})),
             }
             for m in all_matches[1:]
         ]
 
+    # Positive-only cache. A miss or outage is always retried fresh.
     set_cached_animal(cache_key, best)
     return best
 
@@ -588,7 +679,13 @@ async def ask_vet(q: VetQuestion):
     animal_record = None
     animal_context = ""
     if q.tag_epc and q.herdmate_sheet_id:
-        animal_record = find_animal(q.herdmate_sheet_id, q.tag_epc)
+        try:
+            animal_record = find_animal(q.herdmate_sheet_id, q.tag_epc)
+        except AnimalLookupUnavailable as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"HerdMate animal records are temporarily unavailable: {e}"
+            ) from e
         if animal_record:
             animal_context = format_animal_context(animal_record)
 
@@ -1180,7 +1277,7 @@ async def animal_health():
         "status": "ok",
         "service": "HerdMate Sentinel Animal Lookup",
         "dave_service": True,
-        "version": "1.2.0"
+        "version": "1.2.1"
     }
 
 @app.post("/animal/lookup")
@@ -1219,10 +1316,18 @@ async def animal_lookup(request: AnimalLookupRequest):
 
     animal = None
     matched_identifier = ""
+    lookup_unavailable = None
 
     try:
         for candidate in lookup_candidates:
-            animal = find_animal(sheet_id, candidate)
+            try:
+                animal = find_animal(sheet_id, candidate)
+            except AnimalLookupUnavailable as exception:
+                # Keep trying fallback identifiers. A full EPC may not match
+                # while its 15-digit suffix does, even if another tab had a
+                # temporary failure during the first attempt.
+                lookup_unavailable = exception
+                continue
 
             if animal:
                 matched_identifier = candidate
@@ -1233,6 +1338,14 @@ async def animal_lookup(request: AnimalLookupRequest):
             status_code=500,
             detail=f"Animal lookup failed: {exception}"
         ) from exception
+
+    if not animal and lookup_unavailable is not None:
+        # No candidate produced a trustworthy match, and at least one search
+        # was incomplete. Report availability failure, never false NOT_FOUND.
+        raise HTTPException(
+            status_code=503,
+            detail=f"HerdMate animal records are temporarily unavailable: {lookup_unavailable}"
+        ) from lookup_unavailable
 
     timestamp = datetime.now().isoformat()
 
