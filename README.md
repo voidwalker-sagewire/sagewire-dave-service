@@ -90,9 +90,47 @@ copies both. Deploy the updated Vet Station client to enable session-aware
 memory there. Older clients retain normal chat but need a session-ID update
 to participate in cross-session memory.
 
-Validation: `python -m unittest discover -s tests -v` (13 offline tests).
+Validation: `python -m unittest discover -s tests -v` (21 offline tests).
 These test orchestration and citation/memory rules with external dependencies
 stubbed; they do not assess model medical advice or a live Chroma deployment.
+
+### Replaying field cases before a field release
+
+`tests/field_case_replay.py` accepts the original exported Markdown conversations
+and saved MHT snapshot. It extracts exact user turns, old answers where present,
+source-file hashes, and review criteria. Private exports and generated reports
+belong outside this public repository; do not commit them or their photos.
+
+```
+python tests/field_case_replay.py prepare --input-dir /private/exports --output /private/suite.json
+python tests/field_case_replay.py audit --suite /private/suite.json --output /private/baseline-audit.json
+python tests/field_case_replay.py replay --suite /private/suite.json --api-base http://127.0.0.1:5006 --repeats 3 --output /private/revised-replay.json
+```
+
+Run the revised service separately on staging (for example PORT=5006), with
+access to the intended veterinary corpus and model credential. Do not point it
+at a writable production memory collection: use a separate Chroma data copy.
+The replay uses no animal sheet or real user identity, which disables memory
+read/write under the revised policy. It refuses known production URLs and
+checks `conversation_policy_revision=field-evidence-1` before sending questions.
+
+Each conversation starts fresh and uses the **newly generated** answers as its
+history. Old AI answers are retained only for side-by-side review. Repeated runs
+check for inconsistent behavior. Any failed turn stops that case so missing
+context cannot silently distort later turns. Historic dates in filenames are
+not evidence of the deployment's actual date or a diagnosis/outcome.
+
+The supplied batch extracts to 8 conversations and 52 user turns; 47 recorded
+answers are present. The bloat-photo export contains debug questions only,
+so its 5 baseline answers are marked missing. Image bytes and contemporaneous
+animal-sheet snapshots are not supplied by these text exports. Text-only runs
+must ask for missing photos/labels rather than claim to have read them.
+
+The baseline audit flags known failure signatures for review. An absence of
+flags is **not a clinical pass**. Medication review criteria link to exact
+manufacturer labels on DailyMed and the manufacturer site; other clinical
+criteria still need veterinary review. Every new model answer must be assessed
+for factual consistency, urgency, relevant evidence, and useful next actions.
 
 ---
 

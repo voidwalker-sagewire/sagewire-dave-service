@@ -85,6 +85,7 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 # allowed by the SageWire rule; a service never depends on a product.
 RAG_SERVICE_URL = os.environ.get("RAG_SERVICE_URL", "")  # e.g. https://rag.sagewire.dev
 SERVER_PORT = int(os.environ.get("PORT", "5005"))
+CONVERSATION_POLICY_REVISION = "field-evidence-1"
 
 # Fail fast and loud if the key is missing. This is the single guard that
 # prevents DAVE from silently degrading into a keyless wrapper that returns
@@ -210,6 +211,7 @@ class VetAnswer(BaseModel):
     source_details: list = Field(default_factory=list)
     evidence_status: str = "unverified"
     history_kind: str = "unverified_conversation"
+    conversation_policy_revision: str = CONVERSATION_POLICY_REVISION
 
 # ── GOOGLE SHEETS LOOKUP ──
 def sheets_get(token: str, sheet_id: str, range_name: str):
@@ -1483,6 +1485,7 @@ async def animal_lookup(request: AnimalLookupRequest):
 async def vet_status():
     return {
         "status": "online",
+        "conversation_policy_revision": CONVERSATION_POLICY_REVISION,
         "vet_knowledge_docs": vet_collection.count(),
         "field_memory_docs": memory_collection.count(),
         "ready": vet_collection.count() > 0,
