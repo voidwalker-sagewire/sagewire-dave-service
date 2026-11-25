@@ -57,6 +57,43 @@ STATUS:   (set when deployed)
 }
 ```
 
+### Conversation and evidence behavior
+
+Clients may send `session_id` (a fresh random ID for each new animal
+conversation). Current-session messages are never returned as prior field
+conversations. Memory is namespaced by user, operation, and sheet. Shared
+default identities and clients without session IDs do not read or write
+cross-session memory. These namespaces are caller-supplied, not authentication;
+the existing API still needs an authenticated identity boundary before this
+can be treated as multi-user isolation.
+
+Previously stored `field_case` records remain on disk but are excluded from
+recall: they contain unverified AI replies, not confirmed diagnoses/outcomes.
+New records are `field_conversation`. No historical records are deleted.
+
+Reference searches include user observations from the conversation, not just
+the last short follow-up. The model returns a JSON answer with explicit passage
+IDs. The service validates those IDs, renumbers inline citations, and returns
+only the sources actually cited. Invalid citation output returns HTTP 502 and
+is not saved to memory. Existing clients continue to receive an ordinary
+`answer` string and `sources` list.
+
+`confidence` is now `unverified`; retrieving a nearest-neighbor passage is not
+a measurement of clinical confidence. `evidence_status` is `cited_references`
+or `no_supporting_reference`. **Citation validation proves provenance, not
+semantic support or clinical correctness.** Retrieval quality and adherence to
+the revised triage/medication instructions require live-model evaluation and
+veterinary review before clinical reliability claims.
+
+Deploy `dave_conversation.py` alongside `herdmate_vet_api.py`. The Dockerfile
+copies both. Deploy the updated Vet Station client to enable session-aware
+memory there. Older clients retain normal chat but need a session-ID update
+to participate in cross-session memory.
+
+Validation: `python -m unittest discover -s tests -v` (13 offline tests).
+These test orchestration and citation/memory rules with external dependencies
+stubbed; they do not assess model medical advice or a live Chroma deployment.
+
 ---
 
 ## How DAVE reads the sheet (v4 — dynamic)
