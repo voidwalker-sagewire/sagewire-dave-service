@@ -259,7 +259,9 @@ def replay(suite, api_base, repeats=1):
                                     "status": "request_error", "error": str(error)})
                     # Do not continue downstream without the missing response.
                     break
-    return {"kind": "revised_api_replay", "new_model_tested": True, "api_base": api_base,
+    return {"kind": "revised_api_replay",
+            "new_model_tested": any(row["status"] == "manual_review_required" for row in results),
+            "api_base": api_base,
             "policy_revision": POLICY_REVISION, "repeats": repeats,
             "summary": summarize(results), "turns": results, "limitations": suite["limitations"]}
 

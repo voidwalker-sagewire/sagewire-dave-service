@@ -90,7 +90,7 @@ copies both. Deploy the updated Vet Station client to enable session-aware
 memory there. Older clients retain normal chat but need a session-ID update
 to participate in cross-session memory.
 
-Validation: `python -m unittest discover -s tests -v` (21 offline tests).
+Validation: `python -m unittest discover -s tests -v` (28 offline tests).
 These test orchestration and citation/memory rules with external dependencies
 stubbed; they do not assess model medical advice or a live Chroma deployment.
 
@@ -131,6 +131,34 @@ flags is **not a clinical pass**. Medication review criteria link to exact
 manufacturer labels on DailyMed and the manufacturer site; other clinical
 criteria still need veterinary review. Every new model answer must be assessed
 for factual consistency, urgency, relevant evidence, and useful next actions.
+
+### Existing Docker server launcher
+
+The private server-test bundle adds `server_case_launcher.py` (packaged as
+`start_test.py`), `export_vet_corpus.py`, `seed_vet_corpus.py`, and
+`server_case_worker.py`. It includes the exact private suite and revised source;
+private transcripts are not committed here.
+
+The launcher inspects the selected production DAVE container and requires the
+expected deployed revision. It reuses that exact installed image, reads only
+the veterinary reference collection, exports its text/metadata/vectors, and
+seeds a brand-new database in a new private directory. No production memory,
+Google credentials, network configuration, or volume mounts are inherited.
+Model access stays on the server: the launcher copies only the model credential
+and model settings into a temporary mode-600 env file and unlinks that file
+after container creation. Docker's normal root/admin access to container
+environments still applies.
+
+The separate test container has no published ports or proxy labels, uses the
+default bridge for model API access, and is limited to one CPU and 2 GiB RAM.
+It runs in the background and stops its test API after the replay finishes.
+Output records full answers, sources, errors, model/revision details, source
+hashes, and review criteria. A successful HTTP reply is never a clinical pass.
+Normal model API usage applies (52 maximum question requests for one complete
+pass of this supplied suite; errors stop the affected conversation).
+
+The launcher tests are offline. Docker/image compatibility, reference export,
+and the live model replay still need to be exercised on the existing server.
 
 ---
 
