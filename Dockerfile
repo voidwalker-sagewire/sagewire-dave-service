@@ -31,6 +31,7 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 
 # App code
 COPY herdmate_vet_api.py .
+COPY dave_conversation.py .
 COPY herdmate_vet_ingest.py .
 COPY unl_sources.txt .
 

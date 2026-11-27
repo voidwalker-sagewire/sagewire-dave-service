@@ -57,6 +57,155 @@ STATUS:   (set when deployed)
 }
 ```
 
+### Conversation and evidence behavior
+
+Clients may send `session_id` (a fresh random ID for each new animal
+conversation). Current-session messages are never returned as prior field
+conversations. Memory is namespaced by user, operation, and sheet. Shared
+default identities and clients without session IDs do not read or write
+cross-session memory. These namespaces are caller-supplied, not authentication;
+the existing API still needs an authenticated identity boundary before this
+can be treated as multi-user isolation.
+
+Previously stored `field_case` records remain on disk but are excluded from
+recall: they contain unverified AI replies, not confirmed diagnoses/outcomes.
+New records are `field_conversation`. No historical records are deleted.
+
+Reference searches include user observations from the conversation, not just
+the last short follow-up. The API forces the Haiku model to use a single
+`submit_field_reply` tool with answer/source fields, rather than relying on a
+prompt asking it to print JSON. The service reads the tool input, validates
+passage IDs, renumbers inline citations, and returns
+only the sources actually cited. Invalid citation output returns HTTP 502 and
+is not saved to memory. Existing clients continue to receive an ordinary
+`answer` string and `sources` list.
+
+`confidence` is now `unverified`; retrieving a nearest-neighbor passage is not
+a measurement of clinical confidence. `evidence_status` is `cited_references`
+or `no_supporting_reference`. **Citation validation proves provenance, not
+semantic support or clinical correctness.** Retrieval quality and adherence to
+the revised triage/medication instructions require live-model evaluation and
+veterinary review before clinical reliability claims.
+
+Deploy `dave_conversation.py` alongside `herdmate_vet_api.py`. The Dockerfile
+copies both. Deploy the updated Vet Station client to enable session-aware
+memory there. Older clients retain normal chat but need a session-ID update
+to participate in cross-session memory.
+
+Validation: `python -m unittest discover -s tests -v` (44 offline tests; the
+encryption checks require `cryptography` in the test environment).
+These test orchestration and citation/memory rules with external dependencies
+stubbed; they do not assess model medical advice or a live Chroma deployment.
+
+### Replaying field cases before a field release
+
+`tests/field_case_replay.py` accepts the original exported Markdown conversations
+and saved MHT snapshot. It extracts exact user turns, old answers where present,
+source-file hashes, and review criteria. Private exports and generated reports
+belong outside this public repository; do not commit them or their photos.
+
+```
+python tests/field_case_replay.py prepare --input-dir /private/exports --output /private/suite.json
+python tests/field_case_replay.py audit --suite /private/suite.json --output /private/baseline-audit.json
+python tests/field_case_replay.py replay --suite /private/suite.json --api-base http://127.0.0.1:5006 --repeats 3 --output /private/revised-replay.json
+```
+
+Run the revised service separately on staging (for example PORT=5006), with
+access to the intended veterinary corpus and model credential. Do not point it
+at a writable production memory collection: use a separate Chroma data copy.
+The replay uses no animal sheet or real user identity, which disables memory
+read/write under the revised policy. It refuses known production URLs and
+checks `conversation_policy_revision=field-evidence-2` before sending questions.
+
+Each conversation starts fresh and uses the **newly generated** answers as its
+history. Old AI answers are retained only for side-by-side review. Repeated runs
+check for inconsistent behavior. Any failed turn stops that case so missing
+context cannot silently distort later turns. Historic dates in filenames are
+not evidence of the deployment's actual date or a diagnosis/outcome.
+
+The supplied batch extracts to 8 conversations and 52 user turns; 47 recorded
+answers are present. The bloat-photo export contains debug questions only,
+so its 5 baseline answers are marked missing. Image bytes and contemporaneous
+animal-sheet snapshots are not supplied by these text exports. Text-only runs
+must ask for missing photos/labels rather than claim to have read them.
+
+The baseline audit flags known failure signatures for review. An absence of
+flags is **not a clinical pass**. Medication review criteria link to exact
+manufacturer labels on DailyMed and the manufacturer site; other clinical
+criteria still need veterinary review. Every new model answer must be assessed
+for factual consistency, urgency, relevant evidence, and useful next actions.
+
+### Existing Docker server launcher
+
+The private server-test bundle adds `server_case_launcher.py` (packaged as
+`start_test.py`), `export_vet_corpus.py`, `seed_vet_corpus.py`, and
+`server_case_worker.py`. It includes the exact private suite and revised source;
+private transcripts are not committed here.
+
+The launcher inspects the selected production DAVE container and requires the
+expected deployed revision. It reuses that exact installed image, reads only
+the veterinary reference collection, exports its text/metadata/vectors, and
+seeds a brand-new database in a new private directory. No production memory,
+Google credentials, network configuration, or volume mounts are inherited.
+Model access stays on the server: the launcher copies only the model credential
+and model settings into a temporary mode-600 env file and unlinks that file
+after container creation. Docker's normal root/admin access to container
+environments still applies.
+
+The separate test container has no published ports or proxy labels, uses the
+default bridge for model API access, and is limited to one CPU and 2 GiB RAM.
+It runs in the background and stops its test API after the replay finishes.
+Output records full answers, sources, errors, model/revision details, source
+hashes, and review criteria. A successful HTTP reply is never a clinical pass.
+Normal model API usage applies (one format-check request plus up to 52 question
+requests for one complete pass of this supplied suite; errors stop the affected
+conversation). The current worker checks one real provider reply first and
+stops before the full replay if that format check fails.
+
+The launcher tests are offline. Docker/image compatibility, reference export,
+and the live model replay still need to be exercised on the existing server.
+
+`tests/start_case_test_from_drive.py` can fetch the exact private bundle on the
+server using DAVE's existing service-account credential. Grant only that verified
+account reader access to the exact Drive file first. The bootstrap checks the
+credential's account email and the expected archive SHA-256 before extracting
+or starting anything. No public sharing or phone storage access is needed.
+The download uses the Drive API; its project must have that API enabled.
+
+If the existing Google account is unavailable, an authenticated encrypted
+transfer avoids changing production credentials. Only AES-256-GCM ciphertext
+is placed in `test-transfer/server-cases.aesgcm.json`; the random 256-bit key
+is held separately and must never be committed. The server bootstrap reads
+`DAVE_TRANSFER_KEY` from its private environment, removes it before launching
+subprocesses, and passes it by stdin into a disposable decryptor. That
+container reuses only the installed image, with no production mounts or env.
+If needed it installs a binary `cryptography` wheel in its disposable layer.
+After authenticated decryption, the archive hash is checked before extraction.
+The same isolated replay launcher then starts. No Google credential is read
+by this transfer path. Keep the key private: publishing ciphertext is safe
+only while its corresponding key remains private.
+
+If a replay fails response validation, `tests/diagnose_server_reply.py` can
+capture one new raw reply, its stop reason, and exact validation exception from
+a stopped replay's separate DB/code. It refuses production container names and
+unexpected mounts. The raw diagnostic stays in the private replay output folder;
+the normal API exposes only a validation reason, never an unvalidated answer.
+Replay HTTP failures now preserve the response body for subsequent diagnosis.
+
+The first real probe showed ordinary text with `stop_reason=end_turn`, rejected
+by prompt-only JSON parsing. The native forced-tool path fixes that boundary
+for the observed Haiku 4.5 model. It does not accept free text as an uncited
+medical answer. Reference-ID agreement and truncation checks remain in place.
+See Anthropic's tool definition/choice documentation:
+https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools
+
+`tests/rerun_server_cases.py` takes a stopped replay container and a pinned
+revision, makes new copies of its private code/cases and isolated DB, overlays
+the revised public source, and starts a new background test. The previous
+report is retained. Opt-in validation diagnostics go to the new private output
+folder, and reports include accepted-reply counts separately from clinical
+review. No live production deployment is performed by this rerun helper.
+
 ---
 
 ## How DAVE reads the sheet (v4 — dynamic)
