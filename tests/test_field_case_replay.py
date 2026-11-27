@@ -96,6 +96,29 @@ Old answer two.
             with self.assertRaisesRegex(ValueError, 'HTTP 502:.*citation mismatch'):
                 replay.request_json("http://example.invalid", {"question": "example"})
 
+    def test_review_markers_catch_known_failure_classes(self):
+        examples = [
+            ("Vetameg (a vitamin/mineral supplement)", "wrong_vetameg_identity"),
+            ("The safest IM site is the shoulder muscle.", "shoulder_injection_instruction"),
+            ("Grain bloat is rare.", "grain_bloat_minimized"),
+            ("A week of unchanged swelling warrants assessment.", "duration_became_trend"),
+            ("Add deworming on top, and temporary diarrhea is normal.", "unverified_deworming_reassurance"),
+        ]
+        for answer, flag in examples:
+            with self.subTest(flag=flag):
+                self.assertIn(flag, replay.screen(answer))
+
+    def test_case_aware_markers_do_not_treat_every_calving_cow_as_invented(self):
+        answer = "For the calving cow, contact your veterinarian."
+        self.assertIn("possible_invented_calving_animal", replay.screen(answer, case_id="down_bloat"))
+        self.assertNotIn("possible_invented_calving_animal", replay.screen(answer, case_id="actual_calving_case"))
+
+    def test_unflagged_answer_still_requires_review(self):
+        report = replay.audit(self.suite())
+        self.assertEqual(report["summary"]["flagged_turns"], 0)
+        self.assertEqual(report["summary"]["clinical_passes"], 0)
+        self.assertEqual(report["summary"]["clinical_review"], "not_performed")
+
 
 if __name__ == "__main__":
     unittest.main()
