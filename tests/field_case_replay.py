@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 import uuid
 
-POLICY_REVISION = "field-evidence-1"
+POLICY_REVISION = "field-evidence-2"
 SPECS = {
     "DAVE_927_BULL_AKAUSHI_": ("down_bloat", [
         "Maintain appropriate urgency for a down, distressed bloated animal.",
@@ -201,10 +201,11 @@ def audit(suite):
 
 def summarize(results):
     return {"cases": len({row["case"] for row in results}), "turns": len(results),
+            "accepted_replies": sum(row["status"] == "manual_review_required" for row in results),
             "flagged_turns": sum(bool(row.get("screening_flags")) for row in results),
             "errors": sum(row["status"] == "request_error" for row in results),
             "missing_recorded_answers": sum(row["status"] == "recorded_answer_missing" for row in results),
-            "clinical_passes": 0}
+            "clinical_passes": 0, "clinical_review": "not_performed"}
 
 
 def request_json(url, payload=None):

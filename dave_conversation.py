@@ -4,6 +4,44 @@ import hashlib
 import json
 import re
 
+REPLY_TOOL_NAME = "submit_field_reply"
+
+
+def reply_tool(reference_ids):
+    """Use Claude's tool protocol for shape, rather than prompt-only JSON."""
+    items = {"type": "string"}
+    if reference_ids:
+        items["enum"] = list(reference_ids)
+    source_ids = {"type": "array", "items": items,
+                  "description": "Exactly the supplied passage IDs cited inline in answer, or [] if none apply."}
+    if not reference_ids:
+        source_ids["maxItems"] = 0
+    return {
+        "name": REPLY_TOOL_NAME,
+        "description": "Submit DAVE's user-facing field reply and the passage IDs supporting its inline citations. This submits a reply, not a treatment action.",
+        "input_schema": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "answer": {"type": "string", "description": "The natural conversational reply. Cite relevant provided passages inline as [V1], etc. Ask a concise clarification when needed."},
+                "source_ids": source_ids,
+            },
+            "required": ["answer", "source_ids"],
+        },
+    }
+
+
+def extract_reply_input(response):
+    """Never reinterpret free-text, truncated, or refused output as a reply."""
+    if getattr(response, "stop_reason", None) in ("max_tokens", "refusal"):
+        raise ValueError("Model reply was truncated or refused")
+    calls = [block for block in response.content if getattr(block, "type", None) == "tool_use"]
+    if len(calls) != 1 or getattr(calls[0], "name", None) != REPLY_TOOL_NAME:
+        raise ValueError("Expected one submit_field_reply tool response; received ordinary text or unexpected tool output")
+    payload = getattr(calls[0], "input", None)
+    if not isinstance(payload, dict):
+        raise ValueError("The reply tool input must be an object")
+    return json.dumps(payload, ensure_ascii=False)
+
 
 def clean_history(history):
     """Accept conversational text only; clients cannot supply system messages."""
@@ -86,6 +124,10 @@ def parse_grounded_answer(raw_text, references):
         raise ValueError("DAVE answer is missing")
     if not isinstance(source_ids, list) or any(not isinstance(s, str) for s in source_ids):
         raise ValueError("DAVE source_ids must be a list of reference IDs")
+    # A grouped citation names the same explicit passage IDs; canonicalize it
+    # without accepting an unknown ID or inferring a missing source selection.
+    answer = re.sub(r"\[(V\d+(?:\s*,\s*V\d+)+)\]",
+                    lambda match: " ".join("[" + item.strip() + "]" for item in match[1].split(",")), answer)
     cited_ids = re.findall(r"\[(V\d+)\]", answer)
     if any(s not in references for s in source_ids + cited_ids):
         raise ValueError("DAVE cited a reference that was not supplied")

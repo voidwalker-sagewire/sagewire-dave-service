@@ -1,13 +1,38 @@
 import json
 import unittest
+import types
 
 from dave_conversation import (
     clean_history, filter_memories, knowledge_query, memory_scope,
     parse_grounded_answer,
+    reply_tool, extract_reply_input,
 )
 
 
 class ConversationTests(unittest.TestCase):
+    def test_reply_tool_limits_source_ids_and_handles_no_references(self):
+        schema = reply_tool(["V1", "V2"])["input_schema"]
+        self.assertEqual(schema["properties"]["source_ids"]["items"]["enum"], ["V1", "V2"])
+        no_sources = reply_tool([])["input_schema"]["properties"]["source_ids"]
+        self.assertEqual(no_sources["maxItems"], 0)
+        self.assertNotIn("enum", no_sources["items"])
+
+    def test_structured_tool_input_preserves_quotes_and_newlines(self):
+        payload = {"answer": 'He said "warm".\nWhat changed?', "source_ids": []}
+        response = types.SimpleNamespace(stop_reason="tool_use", content=[
+            types.SimpleNamespace(type="text", text="Ignored narration"),
+            types.SimpleNamespace(type="tool_use", name="submit_field_reply", input=payload),
+        ])
+        self.assertEqual(json.loads(extract_reply_input(response)), payload)
+
+    def test_truncated_or_wrong_tool_output_is_rejected(self):
+        block = types.SimpleNamespace(type="tool_use", name="submit_field_reply", input={"answer": "x", "source_ids": []})
+        with self.assertRaises(ValueError):
+            extract_reply_input(types.SimpleNamespace(stop_reason="max_tokens", content=[block]))
+        block.name = "unexpected"
+        with self.assertRaises(ValueError):
+            extract_reply_input(types.SimpleNamespace(stop_reason="tool_use", content=[block]))
+
     def test_short_followup_keeps_presenting_complaint_but_not_ai_diagnosis(self):
         history = clean_history([
             {"role": "user", "content": "Feeder calf has a swollen knee."},
@@ -63,6 +88,14 @@ class ConversationTests(unittest.TestCase):
         }), {"V1": "same-source", "V2": "same-source"})
         self.assertEqual(sources, ["same-source"])
         self.assertEqual(answer, "First [1]. Second [1].")
+
+    def test_grouped_citations_keep_explicit_selection_and_unknown_id_checks(self):
+        payload = {"answer": "An observation [V1, V2].", "source_ids": ["V1", "V2"]}
+        answer, sources, _ = parse_grounded_answer(json.dumps(payload), {"V1": "one", "V2": "two"})
+        self.assertEqual(answer, "An observation [1] [2].")
+        self.assertEqual(sources, ["one", "two"])
+        with self.assertRaises(ValueError):
+            parse_grounded_answer(json.dumps(payload), {"V1": "one"})
 
     def test_no_relevant_source_does_not_attach_nearest_neighbours(self):
         answer, sources, details = parse_grounded_answer(json.dumps({

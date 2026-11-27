@@ -72,8 +72,10 @@ recall: they contain unverified AI replies, not confirmed diagnoses/outcomes.
 New records are `field_conversation`. No historical records are deleted.
 
 Reference searches include user observations from the conversation, not just
-the last short follow-up. The model returns a JSON answer with explicit passage
-IDs. The service validates those IDs, renumbers inline citations, and returns
+the last short follow-up. The API forces the Haiku model to use a single
+`submit_field_reply` tool with answer/source fields, rather than relying on a
+prompt asking it to print JSON. The service reads the tool input, validates
+passage IDs, renumbers inline citations, and returns
 only the sources actually cited. Invalid citation output returns HTTP 502 and
 is not saved to memory. Existing clients continue to receive an ordinary
 `answer` string and `sources` list.
@@ -90,7 +92,7 @@ copies both. Deploy the updated Vet Station client to enable session-aware
 memory there. Older clients retain normal chat but need a session-ID update
 to participate in cross-session memory.
 
-Validation: `python -m unittest discover -s tests -v` (37 offline tests; the
+Validation: `python -m unittest discover -s tests -v` (44 offline tests; the
 encryption checks require `cryptography` in the test environment).
 These test orchestration and citation/memory rules with external dependencies
 stubbed; they do not assess model medical advice or a live Chroma deployment.
@@ -113,7 +115,7 @@ access to the intended veterinary corpus and model credential. Do not point it
 at a writable production memory collection: use a separate Chroma data copy.
 The replay uses no animal sheet or real user identity, which disables memory
 read/write under the revised policy. It refuses known production URLs and
-checks `conversation_policy_revision=field-evidence-1` before sending questions.
+checks `conversation_policy_revision=field-evidence-2` before sending questions.
 
 Each conversation starts fresh and uses the **newly generated** answers as its
 history. Old AI answers are retained only for side-by-side review. Repeated runs
@@ -155,8 +157,10 @@ default bridge for model API access, and is limited to one CPU and 2 GiB RAM.
 It runs in the background and stops its test API after the replay finishes.
 Output records full answers, sources, errors, model/revision details, source
 hashes, and review criteria. A successful HTTP reply is never a clinical pass.
-Normal model API usage applies (52 maximum question requests for one complete
-pass of this supplied suite; errors stop the affected conversation).
+Normal model API usage applies (one format-check request plus up to 52 question
+requests for one complete pass of this supplied suite; errors stop the affected
+conversation). The current worker checks one real provider reply first and
+stops before the full replay if that format check fails.
 
 The launcher tests are offline. Docker/image compatibility, reference export,
 and the live model replay still need to be exercised on the existing server.
@@ -187,6 +191,20 @@ a stopped replay's separate DB/code. It refuses production container names and
 unexpected mounts. The raw diagnostic stays in the private replay output folder;
 the normal API exposes only a validation reason, never an unvalidated answer.
 Replay HTTP failures now preserve the response body for subsequent diagnosis.
+
+The first real probe showed ordinary text with `stop_reason=end_turn`, rejected
+by prompt-only JSON parsing. The native forced-tool path fixes that boundary
+for the observed Haiku 4.5 model. It does not accept free text as an uncited
+medical answer. Reference-ID agreement and truncation checks remain in place.
+See Anthropic's tool definition/choice documentation:
+https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools
+
+`tests/rerun_server_cases.py` takes a stopped replay container and a pinned
+revision, makes new copies of its private code/cases and isolated DB, overlays
+the revised public source, and starts a new background test. The previous
+report is retained. Opt-in validation diagnostics go to the new private output
+folder, and reports include accepted-reply counts separately from clinical
+review. No live production deployment is performed by this rerun helper.
 
 ---
 

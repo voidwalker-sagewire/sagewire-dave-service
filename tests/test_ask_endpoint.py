@@ -47,7 +47,8 @@ api = load_api()
 
 class AskEndpointTests(unittest.TestCase):
     def run_ask(self, payload, model_payload):
-        response = types.SimpleNamespace(content=[types.SimpleNamespace(type="text", text=json.dumps(model_payload))])
+        response = types.SimpleNamespace(stop_reason="tool_use", content=[types.SimpleNamespace(
+            type="tool_use", name="submit_field_reply", input=model_payload)])
         with patch.object(api, "search_knowledge", return_value=[("Winter feed", {"source": "winter"}), ("Joint exam", {"source": "joint"})]) as search, \
              patch.object(api, "search_memory", return_value=[]) as memory, \
              patch.object(api, "save_to_memory") as save, \
@@ -72,6 +73,8 @@ class AskEndpointTests(unittest.TestCase):
         self.assertEqual(memory.args[2], "chat-1")
         self.assertEqual(save.call_args.kwargs["metadata"]["session_id"], "chat-1")
         self.assertEqual(model.kwargs["messages"][-1], {"role": "user", "content": "Warm in the middle."})
+        self.assertEqual(model.kwargs["tool_choice"]["type"], "tool")
+        self.assertEqual(model.kwargs["tool_choice"]["name"], "submit_field_reply")
 
     def test_retrieved_but_uncited_sources_are_not_returned(self):
         result, *_ = self.run_ask({"question": "Unfinished sentence"}, {
@@ -85,11 +88,26 @@ class AskEndpointTests(unittest.TestCase):
              patch.object(api, "search_memory", return_value=[]), \
              patch.object(api, "save_to_memory") as save, \
              patch.object(api.claude.messages, "create", return_value=types.SimpleNamespace(content=[
-                 types.SimpleNamespace(type="text", text='{"answer":"Claim [V99]","source_ids":["V99"]}')
+                 types.SimpleNamespace(type="tool_use", name="submit_field_reply",
+                                       input={"answer": "Claim [V99]", "source_ids": ["V99"]})
              ])):
             with self.assertRaises(api.HTTPException) as raised:
                 asyncio.run(api.ask_vet(api.VetQuestion(question="Question")))
             self.assertEqual(raised.exception.status_code, 502)
+            save.assert_not_called()
+
+    def test_observed_plain_chat_output_is_not_silently_accepted_or_saved(self):
+        response = types.SimpleNamespace(stop_reason="end_turn", content=[types.SimpleNamespace(
+            type="text", text="I need the product label before discussing a dose.")])
+        with patch.object(api, "search_knowledge", return_value=[]), \
+             patch.object(api, "search_memory", return_value=[]), \
+             patch.object(api, "save_to_memory") as save, \
+             patch.object(api.claude.messages, "create", return_value=response) as model:
+            with self.assertRaises(api.HTTPException) as raised:
+                asyncio.run(api.ask_vet(api.VetQuestion(question="An incomplete medication question")))
+            self.assertEqual(model.call_args.kwargs["tool_choice"]["type"], "tool")
+            self.assertEqual(raised.exception.status_code, 502)
+            self.assertIn("Expected one submit_field_reply", raised.exception.detail["reason"])
             save.assert_not_called()
 
     def test_legacy_client_without_session_does_not_retrieve_or_save_shared_memory(self):

@@ -30,6 +30,7 @@ microphone work — browsers block those on plain HTTP.
 import os
 import json
 import hashlib
+from pathlib import Path
 import requests as http_requests
 from datetime import datetime
 from typing import Optional
@@ -46,6 +47,7 @@ import google.auth.transport.requests
 from dave_conversation import (
     clean_history, knowledge_query, memory_scope, filter_memories,
     parse_grounded_answer,
+    reply_tool, extract_reply_input, REPLY_TOOL_NAME,
 )
 
 app = FastAPI(title="HerdMate DAVE Vet AI", version="4.0.0")
@@ -85,7 +87,7 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 # allowed by the SageWire rule; a service never depends on a product.
 RAG_SERVICE_URL = os.environ.get("RAG_SERVICE_URL", "")  # e.g. https://rag.sagewire.dev
 SERVER_PORT = int(os.environ.get("PORT", "5005"))
-CONVERSATION_POLICY_REVISION = "field-evidence-1"
+CONVERSATION_POLICY_REVISION = "field-evidence-2"
 
 # Fail fast and loud if the key is missing. This is the single guard that
 # prevents DAVE from silently degrading into a keyless wrapper that returns
@@ -738,11 +740,11 @@ EVIDENCE AND OUTPUT:
   invent source IDs, URLs, or quote a passage you were not given.
 - If no supplied passage supports an answer, say so briefly. Ask a focused
   question or offer cautious triage; do not give unsourced treatment instructions.
-- Return ONLY one JSON object with two keys:
-  {"answer": "Plain-language answer with inline [V1] citations where supported.",
-   "source_ids": ["V1"]}
-  source_ids must match exactly the IDs cited in answer. Use [] when none apply.
-  Markdown within the answer string is allowed. No code fence or extra text."""
+- Submit the reply once through the submit_field_reply tool. Put the natural
+  conversational answer in answer and exactly its cited passage IDs in source_ids.
+  Use [] when no passage applies. Markdown within answer is allowed.
+  Do not emit an ordinary text response outside the tool. This tool submits
+  text for the rancher to read; it does not perform treatment or execute actions."""
 
 # ── MAIN ENDPOINT ──
 @app.post("/vet/ask", response_model=VetAnswer)
@@ -843,20 +845,40 @@ async def ask_vet(q: VetQuestion):
             model=CLAUDE_MODEL,
             max_tokens=1100,
             system=dynamic_system,
-            messages=claude_messages
+            messages=claude_messages,
+            tools=[reply_tool(reference_map)],
+            tool_choice={"type": "tool", "name": REPLY_TOOL_NAME, "disable_parallel_tool_use": True},
         )
-        text_blocks = [b for b in response.content if b.type == "text"]
-        raw_answer = "\n".join(block.text for block in text_blocks)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI response failed: {str(e)}")
 
+    raw_answer = None
     try:
+        raw_answer = extract_reply_input(response)
         answer, sources, source_details = parse_grounded_answer(raw_answer, reference_map)
     except (ValueError, TypeError) as error:
         # Do not show or persist an answer whose citation contract is invalid.
         # Report the validation reason, not the rejected clinical answer.
         reason = type(error).__name__ + ": " + str(error)
         print("DAVE response validation rejected: " + reason, flush=True)
+        diagnostics = os.environ.get("DAVE_REPLAY_DIAGNOSTICS_DIR")
+        if diagnostics:
+            # Opt-in test output only. Never print an unvalidated clinical
+            # answer into normal service logs or return it to the rancher.
+            try:
+                filename = "validation-" + datetime.now().strftime("%Y%m%dT%H%M%S%f") + ".json"
+                Path(diagnostics, filename).write_text(json.dumps({
+                    "question": q.question, "reason": reason,
+                    "stop_reason": getattr(response, "stop_reason", None),
+                    "raw_answer": raw_answer,
+                    "blocks": [{"type": getattr(block, "type", None),
+                                "name": getattr(block, "name", None),
+                                "text": getattr(block, "text", None),
+                                "input": getattr(block, "input", None)} for block in response.content],
+                    "reference_ids": list(reference_map),
+                }, indent=2, ensure_ascii=False))
+            except Exception:
+                print("DAVE could not save replay validation diagnostics", flush=True)
         raise HTTPException(status_code=502, detail={
             "code": "invalid_model_response", "reason": reason,
             "message": "DAVE could not validate the response references. Please retry.",

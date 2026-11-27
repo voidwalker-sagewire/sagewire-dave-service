@@ -35,6 +35,20 @@ def main():
             time.sleep(2)
         else:
             raise RuntimeError("The isolated service did not become ready within four minutes")
+        # Exercise the real provider/SDK/format boundary before a full replay.
+        # Passing this is a format check, not a clinical approval.
+        print("Checking one live reply format before starting the full replay...", flush=True)
+        first_question = suite["cases"][0]["turns"][0]["question"]
+        checked = field_case_replay.request_json("http://127.0.0.1:5005/vet/ask", {
+            "question": first_question, "operation": "RegressionReplay", "user_id": "default",
+            "session_id": "format-preflight", "conversation_history": [],
+        })
+        if not isinstance(checked.get("answer"), str) or not checked["answer"].strip():
+            raise RuntimeError("The reply format check returned no answer")
+        if checked.get("conversation_policy_revision") != field_case_replay.POLICY_REVISION:
+            raise RuntimeError("The format check returned the wrong policy revision")
+        (output / "format-check.json").write_text(json.dumps(checked, indent=2, ensure_ascii=False))
+        print("Reply-format check passed; beginning the full case replay. Clinical review pending.", flush=True)
         original_request = field_case_replay.request_json
         completed = 0
         def progress_request(url, payload=None):
