@@ -90,7 +90,7 @@ copies both. Deploy the updated Vet Station client to enable session-aware
 memory there. Older clients retain normal chat but need a session-ID update
 to participate in cross-session memory.
 
-Validation: `python -m unittest discover -s tests -v` (28 offline tests).
+Validation: `python -m unittest discover -s tests -v` (31 offline tests).
 These test orchestration and citation/memory rules with external dependencies
 stubbed; they do not assess model medical advice or a live Chroma deployment.
 
@@ -159,6 +159,13 @@ pass of this supplied suite; errors stop the affected conversation).
 
 The launcher tests are offline. Docker/image compatibility, reference export,
 and the live model replay still need to be exercised on the existing server.
+
+`tests/start_case_test_from_drive.py` can fetch the exact private bundle on the
+server using DAVE's existing service-account credential. Grant only that verified
+account reader access to the exact Drive file first. The bootstrap checks the
+credential's account email and the expected archive SHA-256 before extracting
+or starting anything. No public sharing or phone storage access is needed.
+The download uses the Drive API; its project must have that API enabled.
 
 ---
 
