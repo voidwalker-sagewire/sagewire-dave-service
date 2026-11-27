@@ -90,7 +90,8 @@ copies both. Deploy the updated Vet Station client to enable session-aware
 memory there. Older clients retain normal chat but need a session-ID update
 to participate in cross-session memory.
 
-Validation: `python -m unittest discover -s tests -v` (31 offline tests).
+Validation: `python -m unittest discover -s tests -v` (35 offline tests; the
+encryption checks require `cryptography` in the test environment).
 These test orchestration and citation/memory rules with external dependencies
 stubbed; they do not assess model medical advice or a live Chroma deployment.
 
@@ -166,6 +167,19 @@ account reader access to the exact Drive file first. The bootstrap checks the
 credential's account email and the expected archive SHA-256 before extracting
 or starting anything. No public sharing or phone storage access is needed.
 The download uses the Drive API; its project must have that API enabled.
+
+If the existing Google account is unavailable, an authenticated encrypted
+transfer avoids changing production credentials. Only AES-256-GCM ciphertext
+is placed in `test-transfer/server-cases.aesgcm.json`; the random 256-bit key
+is held separately and must never be committed. The server bootstrap reads
+`DAVE_TRANSFER_KEY` from its private environment, removes it before launching
+subprocesses, and passes it by stdin into a disposable decryptor. That
+container reuses only the installed image, with no production mounts or env.
+If needed it installs a binary `cryptography` wheel in its disposable layer.
+After authenticated decryption, the archive hash is checked before extraction.
+The same isolated replay launcher then starts. No Google credential is read
+by this transfer path. Keep the key private: publishing ciphertext is safe
+only while its corresponding key remains private.
 
 ---
 
