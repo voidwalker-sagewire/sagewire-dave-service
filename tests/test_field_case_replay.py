@@ -80,6 +80,18 @@ Old answer two.
         self.assertEqual(request.call_count, 2)
         self.assertEqual(report["summary"]["errors"], 1)
 
+    def test_product_lookup_only_replay_does_not_claim_a_new_model_test(self):
+        def request(url, payload=None):
+            result = {"conversation_policy_revision": replay.POLICY_REVISION}
+            if payload is not None:
+                result.update(answer="A checked product fact.", sources=[], reply_origin="product_information")
+            return result
+        with patch.object(replay, "request_json", side_effect=request):
+            report = replay.replay(self.suite(), "http://127.0.0.1:5006")
+        self.assertFalse(report["new_model_tested"])
+        self.assertEqual(report["summary"]["product_information_replies"], 2)
+        self.assertEqual(report["summary"]["clinical_passes"], 0)
+
     def test_audit_is_explicitly_not_a_new_model_result(self):
         report = replay.audit(self.suite())
         self.assertFalse(report["new_model_tested"])

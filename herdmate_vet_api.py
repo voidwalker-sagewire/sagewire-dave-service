@@ -49,6 +49,10 @@ from dave_conversation import (
     parse_grounded_answer,
     reply_tool, extract_reply_input, REPLY_TOOL_NAME,
 )
+from dave_medications import (
+    medication_context, medication_references, medication_instructions,
+    product_information_reply,
+)
 
 app = FastAPI(title="HerdMate DAVE Vet AI", version="4.0.0")
 
@@ -87,7 +91,7 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 # allowed by the SageWire rule; a service never depends on a product.
 RAG_SERVICE_URL = os.environ.get("RAG_SERVICE_URL", "")  # e.g. https://rag.sagewire.dev
 SERVER_PORT = int(os.environ.get("PORT", "5005"))
-CONVERSATION_POLICY_REVISION = "field-evidence-2"
+CONVERSATION_POLICY_REVISION = "field-evidence-3"
 
 # Fail fast and loud if the key is missing. This is the single guard that
 # prevents DAVE from silently degrading into a keyless wrapper that returns
@@ -214,6 +218,7 @@ class VetAnswer(BaseModel):
     evidence_status: str = "unverified"
     history_kind: str = "unverified_conversation"
     conversation_policy_revision: str = CONVERSATION_POLICY_REVISION
+    reply_origin: str = "model"
 
 # ── GOOGLE SHEETS LOOKUP ──
 def sheets_get(token: str, sheet_id: str, range_name: str):
@@ -770,12 +775,22 @@ async def ask_vet(q: VetQuestion):
         if animal_record:
             animal_context = format_animal_context(animal_record)
 
-    # RAG search
-    vet_results = search_knowledge(knowledge_query(q.question, history))
+    # Product identity is exact-name lookup, independent of embedding ranking.
+    # Read only user names, including corrections before the chat window, never
+    # prior AI claims about what the rancher has or administered.
+    medication_keys = medication_context(q.question, q.conversation_history)
+    medication_results = medication_references(medication_keys)
+    medication_ids = {key: f"V{index}" for index, key in enumerate(medication_keys, 1)}
+    information_reply = product_information_reply(
+        q.question, medication_keys, medication_ids, image_present=bool(q.image_base64),
+        history=q.conversation_history,
+    )
+    # Simple label-identity lookups do not require an embedding/model call.
+    vet_results = medication_results + ([] if information_reply else search_knowledge(knowledge_query(q.question, history)))
     past_cases = search_memory(q.question, scope_id, q.session_id, history)
 
     # Build dynamic system prompt
-    dynamic_system = VET_SYSTEM_PROMPT
+    dynamic_system = VET_SYSTEM_PROMPT + medication_instructions(medication_keys)
 
     # Tell DAVE what TODAY is. Without this, the model guesses the year from
     # its training data and can't reason about recently-born animals (e.g. a
@@ -840,21 +855,23 @@ async def ask_vet(q: VetQuestion):
 
     claude_messages.append({"role": "user", "content": current_content})
 
-    try:
-        response = claude.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=1100,
-            system=dynamic_system,
-            messages=claude_messages,
-            tools=[reply_tool(reference_map)],
-            tool_choice={"type": "tool", "name": REPLY_TOOL_NAME, "disable_parallel_tool_use": True},
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI response failed: {str(e)}")
+    response = None
+    if not information_reply:
+        try:
+            response = claude.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=1100,
+                system=dynamic_system,
+                messages=claude_messages,
+                tools=[reply_tool(reference_map)],
+                tool_choice={"type": "tool", "name": REPLY_TOOL_NAME, "disable_parallel_tool_use": True},
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"AI response failed: {str(e)}")
 
     raw_answer = None
     try:
-        raw_answer = extract_reply_input(response)
+        raw_answer = json.dumps(information_reply, ensure_ascii=False) if information_reply else extract_reply_input(response)
         answer, sources, source_details = parse_grounded_answer(raw_answer, reference_map)
     except (ValueError, TypeError) as error:
         # Do not show or persist an answer whose citation contract is invalid.
@@ -874,7 +891,7 @@ async def ask_vet(q: VetQuestion):
                     "blocks": [{"type": getattr(block, "type", None),
                                 "name": getattr(block, "name", None),
                                 "text": getattr(block, "text", None),
-                                "input": getattr(block, "input", None)} for block in response.content],
+                                "input": getattr(block, "input", None)} for block in getattr(response, "content", [])],
                     "reference_ids": list(reference_map),
                 }, indent=2, ensure_ascii=False))
             except Exception:
@@ -883,6 +900,26 @@ async def ask_vet(q: VetQuestion):
             "code": "invalid_model_response", "reason": reason,
             "message": "DAVE could not validate the response references. Please retry.",
         })
+
+    diagnostics = os.environ.get("DAVE_REPLAY_DIAGNOSTICS_DIR")
+    if diagnostics:
+        # Isolated replay only: preserve what was actually supplied, so later
+        # review can distinguish missing references from ignored references.
+        # Credentials and the full system prompt are deliberately not included.
+        try:
+            filename = "evidence-" + datetime.now().strftime("%Y%m%dT%H%M%S%f") + ".json"
+            Path(diagnostics, filename).write_text(json.dumps({
+                "question": q.question, "session_id": q.session_id,
+                "policy_revision": CONVERSATION_POLICY_REVISION,
+                "reply_path": "product_information" if information_reply else "model",
+                "model": None if information_reply else CLAUDE_MODEL,
+                "user_named_medication_references": medication_keys,
+                "references": [{"id": f"V{i}", "source": (meta or {}).get("source"), "passage": doc}
+                               for i, (doc, meta) in enumerate(vet_results, 1)],
+                "answer": answer, "sources": sources,
+            }, indent=2, ensure_ascii=False))
+        except Exception:
+            print("DAVE could not save replay evidence diagnostics", flush=True)
 
     save_to_memory(
         question=q.question,
@@ -906,6 +943,7 @@ async def ask_vet(q: VetQuestion):
         # Citation presence is not a calibrated measure of clinical confidence.
         confidence="unverified",
         evidence_status="cited_references" if sources else "no_supporting_reference",
+        reply_origin="product_information" if information_reply else "model",
         timestamp=datetime.now().isoformat(),
         animal_context=animal_record
     )

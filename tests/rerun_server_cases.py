@@ -16,6 +16,7 @@ from urllib.request import urlopen
 OVERLAYS = {
     "herdmate_vet_api.py": "herdmate_vet_api.py",
     "dave_conversation.py": "dave_conversation.py",
+    "dave_medications.py": "dave_medications.py",
     "tests/field_case_replay.py": "field_case_replay.py",
     "tests/server_case_worker.py": "server_case_worker.py",
 }

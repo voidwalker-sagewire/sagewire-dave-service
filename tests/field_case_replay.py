@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 import uuid
 
-POLICY_REVISION = "field-evidence-2"
+POLICY_REVISION = "field-evidence-3"
 SPECS = {
     "DAVE_927_BULL_AKAUSHI_": ("down_bloat", [
         "Maintain appropriate urgency for a down, distressed bloated animal.",
@@ -214,6 +214,7 @@ def audit(suite):
 def summarize(results):
     return {"cases": len({row["case"] for row in results}), "turns": len(results),
             "accepted_replies": sum(row["status"] == "manual_review_required" for row in results),
+            "product_information_replies": sum(row.get("revised_response", {}).get("reply_origin") == "product_information" for row in results),
             "flagged_turns": sum(bool(row.get("screening_flags")) for row in results),
             "errors": sum(row["status"] == "request_error" for row in results),
             "missing_recorded_answers": sum(row["status"] == "recorded_answer_missing" for row in results),
@@ -279,7 +280,9 @@ def replay(suite, api_base, repeats=1):
                     # Do not continue downstream without the missing response.
                     break
     return {"kind": "revised_api_replay",
-            "new_model_tested": any(row["status"] == "manual_review_required" for row in results),
+            "new_model_tested": any(row["status"] == "manual_review_required"
+                                    and row.get("revised_response", {}).get("reply_origin") != "product_information"
+                                    for row in results),
             "api_base": api_base,
             "policy_revision": POLICY_REVISION, "repeats": repeats,
             "summary": summarize(results), "turns": results, "limitations": suite["limitations"]}

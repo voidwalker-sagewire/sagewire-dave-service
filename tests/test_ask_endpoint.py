@@ -83,6 +83,50 @@ class AskEndpointTests(unittest.TestCase):
         self.assertEqual(result.sources, [])
         self.assertEqual(result.evidence_status, "no_supporting_reference")
 
+    def test_exact_product_information_uses_label_without_model_or_embedding_search(self):
+        result, search, memory, save, model = self.run_ask({
+            "question": "What is Draxxin KP used for?",
+        }, {"answer": "This deliberately wrong model reply must never be used.", "source_ids": []})
+        self.assertIsNone(search)
+        self.assertIsNone(model)
+        self.assertIn("ketoprofen", result.answer)
+        self.assertIn("tulathromycin", result.answer)
+        self.assertIn("dailymed.nlm.nih.gov", result.sources[0])
+        self.assertEqual(result.evidence_status, "cited_references")
+        self.assertEqual(result.conversation_policy_revision, "field-evidence-3")
+        self.assertEqual(result.reply_origin, "product_information")
+
+    def test_vetameg_banamine_name_correction_cannot_become_two_distinct_drugs(self):
+        result, search, _, _, model = self.run_ask({"question": "Vetameg/Banamine"}, {
+            "answer": "Vetameg is a vitamin supplement.", "source_ids": [],
+        })
+        self.assertIsNone(model)
+        self.assertIsNone(search)
+        self.assertIn("flunixin meglumine", result.answer)
+        self.assertEqual(len(result.sources), 2)
+
+    def test_individual_treatment_gets_exact_medication_facts_and_still_calls_model(self):
+        result, search, _, _, model = self.run_ask({
+            "question": "What should I do next?",
+            "conversation_history": [
+                {"role": "user", "content": "Vetameg/Banamine"},
+                {"role": "assistant", "content": "An old wrong identity claim"},
+            ],
+        }, {"answer": "Are you describing one bottle, or were both used?", "source_ids": []})
+        self.assertIsNotNone(model)
+        self.assertIsNotNone(search)
+        system = model.kwargs["system"]
+        self.assertIn("same active drug", system)
+        self.assertIn("IV-only cattle administration", system)
+        self.assertIn("not proof they were given together", system)
+
+    def test_product_with_image_stays_on_model_path_and_keeps_image(self):
+        result, _, _, _, model = self.run_ask({
+            "question": "Draxxin KP", "image_base64": "test-image",
+        }, {"answer": "Which label section do you want to discuss?", "source_ids": []})
+        self.assertIsNotNone(model)
+        self.assertEqual(model.kwargs["messages"][-1]["content"][0]["type"], "image")
+
     def test_invalid_citation_is_neither_displayed_nor_saved(self):
         with patch.object(api, "search_knowledge", return_value=[]), \
              patch.object(api, "search_memory", return_value=[]), \
