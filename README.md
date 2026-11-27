@@ -90,7 +90,7 @@ copies both. Deploy the updated Vet Station client to enable session-aware
 memory there. Older clients retain normal chat but need a session-ID update
 to participate in cross-session memory.
 
-Validation: `python -m unittest discover -s tests -v` (35 offline tests; the
+Validation: `python -m unittest discover -s tests -v` (37 offline tests; the
 encryption checks require `cryptography` in the test environment).
 These test orchestration and citation/memory rules with external dependencies
 stubbed; they do not assess model medical advice or a live Chroma deployment.
@@ -180,6 +180,13 @@ After authenticated decryption, the archive hash is checked before extraction.
 The same isolated replay launcher then starts. No Google credential is read
 by this transfer path. Keep the key private: publishing ciphertext is safe
 only while its corresponding key remains private.
+
+If a replay fails response validation, `tests/diagnose_server_reply.py` can
+capture one new raw reply, its stop reason, and exact validation exception from
+a stopped replay's separate DB/code. It refuses production container names and
+unexpected mounts. The raw diagnostic stays in the private replay output folder;
+the normal API exposes only a validation reason, never an unvalidated answer.
+Replay HTTP failures now preserve the response body for subsequent diagnosis.
 
 ---
 

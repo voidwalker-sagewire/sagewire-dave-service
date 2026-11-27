@@ -852,9 +852,15 @@ async def ask_vet(q: VetQuestion):
 
     try:
         answer, sources, source_details = parse_grounded_answer(raw_answer, reference_map)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as error:
         # Do not show or persist an answer whose citation contract is invalid.
-        raise HTTPException(status_code=502, detail="DAVE could not validate the response references. Please retry.")
+        # Report the validation reason, not the rejected clinical answer.
+        reason = type(error).__name__ + ": " + str(error)
+        print("DAVE response validation rejected: " + reason, flush=True)
+        raise HTTPException(status_code=502, detail={
+            "code": "invalid_model_response", "reason": reason,
+            "message": "DAVE could not validate the response references. Please retry.",
+        })
 
     save_to_memory(
         question=q.question,

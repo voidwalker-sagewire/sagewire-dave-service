@@ -213,8 +213,14 @@ def request_json(url, payload=None):
     if payload is not None:
         data = json.dumps(payload).encode()
         headers["Content-Type"] = "application/json"
-    with urlopen(Request(url, data=data, headers=headers), timeout=90) as response:
-        return json.load(response)
+    try:
+        with urlopen(Request(url, data=data, headers=headers), timeout=90) as response:
+            return json.load(response)
+    except HTTPError as error:
+        # Preserve the server's structured error instead of losing its reason
+        # behind a generic "HTTP Error 502" in the replay report.
+        detail = error.read(16000).decode("utf-8", errors="replace")
+        raise ValueError(f"HTTP {error.code}: {detail}") from error
 
 
 def replay(suite, api_base, repeats=1):

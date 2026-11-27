@@ -1,4 +1,5 @@
 import json
+import io
 import unittest
 from unittest.mock import patch
 
@@ -87,6 +88,13 @@ Old answer two.
     def test_missing_exported_image_does_not_invalidate_original_photo_observation(self):
         self.assertEqual(replay.screen("From the photo, I see swelling.", recorded=True), [])
         self.assertIn("asserted_unseen_photo", replay.screen("From the photo, I see swelling."))
+
+    def test_http_error_body_survives_instead_of_generic_bad_gateway(self):
+        error = replay.HTTPError("http://example.invalid", 502, "Bad Gateway", {},
+                                 io.BytesIO(b'{"detail":{"reason":"citation mismatch"}}'))
+        with patch.object(replay, "urlopen", side_effect=error):
+            with self.assertRaisesRegex(ValueError, 'HTTP 502:.*citation mismatch'):
+                replay.request_json("http://example.invalid", {"question": "example"})
 
 
 if __name__ == "__main__":
